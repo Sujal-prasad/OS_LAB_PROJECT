@@ -150,8 +150,15 @@ namespace Toolkit {
             #endif
         }
 
-        inline void PrintBanner() {
-            std::cout << Color::Cyan() << Color::Bold() << R"(
+        inline void TypeText(const std::string& text, int delay_ms = 18) {
+            for (char c : text) {
+                std::cout << c << std::flush;
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            }
+        }
+
+        inline void PrintBanner(bool animate = false) {
+            const std::string banner = R"(
   +---------------------------------------------------------------------------------+
   |  _____ _   _ ____  _____    _    ____  __        _______    ___   _____ ____    |
   | |_   _| | | |  _ \| ____|  / \  |  _ \ \ \      / / ____|  / _ \ | ____|  _ \   |
@@ -161,7 +168,19 @@ namespace Toolkit {
   |                                                                                 |
   |              INTERACTIVE CONCURRENCY & SYNCHRONIZATION STUDIO                   |
   +---------------------------------------------------------------------------------+
-)" << Color::Reset() << "\n";
+)";
+            std::cout << Color::Cyan() << Color::Bold();
+            if (animate) {
+                std::stringstream ss(banner);
+                std::string line;
+                while (std::getline(ss, line)) {
+                    std::cout << line << "\n" << std::flush;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
+            } else {
+                std::cout << banner;
+            }
+            std::cout << Color::Reset() << "\n";
         }
 
         inline void PrintBreadcrumb(const std::string& path) {
@@ -182,10 +201,13 @@ namespace Toolkit {
                       << Color::Reset() << "\n";
         }
 
+        inline bool animate_menu = false;
+
         inline void PrintMenuCard(const std::string& num, const std::string& title, const std::string& desc) {
             std::cout << "  " << Color::Cyan() << Color::Bold() << "[" << num << "]" << Color::Reset()
                       << " " << Color::Bold() << std::left << std::setw(32) << title << Color::Reset()
-                      << Color::Dim() << desc << Color::Reset() << "\n";
+                      << Color::Dim() << desc << Color::Reset() << "\n" << std::flush;
+            if (animate_menu) std::this_thread::sleep_for(std::chrono::milliseconds(35));
         }
 
         inline void PrintErrorCard(const std::string& err_msg) {
@@ -1014,10 +1036,13 @@ namespace Toolkit {
         void run() {
             UI::InitTerminal();
             bool exit_program = false;
+            bool first_draw = true;
 
             while (!exit_program) {
                 UI::ClearScreen();
-                UI::PrintBanner();
+                UI::PrintBanner(first_draw);
+                UI::animate_menu = first_draw;
+                first_draw = false;
 
                 std::cout << Color::Bold() << "  MAIN CONTROL DASHBOARD (100% USER-INPUT INTERACTIVE)\n" << Color::Reset();
                 std::cout << "  " << std::string(79, '-') << "\n";
@@ -1033,6 +1058,7 @@ namespace Toolkit {
                 UI::PrintMenuCard("0", "Exit Studio", "Terminate application");
 
                 std::cout << "  " << std::string(79, '-') << "\n\n";
+                UI::animate_menu = false;
 
                 int choice = UI::SafeReadInt("  Select Option (0-8): ", 0, 8);
 
@@ -1086,7 +1112,9 @@ namespace Toolkit {
                         break;
                     case 0:
                         exit_program = true;
-                        std::cout << Color::Cyan() << "\n  Exiting ThreadWeaver Studio. Goodbye!\n" << Color::Reset();
+                        std::cout << Color::Cyan() << "\n  ";
+                        UI::TypeText("Exiting ThreadWeaver Studio. Goodbye!", 25);
+                        std::cout << "\n" << Color::Reset();
                         break;
                 }
             }
