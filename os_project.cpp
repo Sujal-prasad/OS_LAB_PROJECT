@@ -1100,4 +1100,3 @@ int main() {
     return 0;
 }
 
-//Stop-Process -Name "os_project" -Force -ErrorAction SilentlyContinue; cd C:\Users\Simpu\Desktop\OS_LAB_PROJECT; chcp 65001; g++ -std=c++17 -pthread os_project.cpp -o os_project.exe; .\os_project.exe
