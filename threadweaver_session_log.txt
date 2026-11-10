@@ -1,4 +1,0 @@
-13:41:25.295 [T1] OK    producer 23: Added 34 to the buffer (1/5).
-13:41:39.976 [T2] OK    consumer 23: Took 34 from the buffer (0/5 left).
-13:42:12.713 [T1] OK    producer 34: Added 1000 to the buffer (1/5).
-13:42:41.360 [T2] OK    producer 23: Added 6000 to the buffer (2/5).

@@ -352,6 +352,7 @@ namespace Toolkit {
         std::ofstream log_file;
         ipc::Mutex file_lock;   // several terminals append to the same file
         bool file_lock_ok = false;
+        bool echo = true;       // also print to the console
         std::string source = "--";
 
     public:
@@ -363,6 +364,13 @@ namespace Toolkit {
         void setSource(const std::string& name) {
             std::lock_guard<std::mutex> lock(log_mutex);
             source = name;
+        }
+
+        // Screens redraw themselves, so console output would just flicker past.
+        // With echo off, messages only go to the log file.
+        void setEcho(bool on) {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            echo = on;
         }
 
         void log(Level level, const std::string& sender, const std::string& message) {
@@ -386,9 +394,11 @@ namespace Toolkit {
                 case Level::OK:    tag = "OK   "; color = Color::Green();  break;
             }
 
-            std::cout << "  " << Color::Dim() << timestamp << Color::Reset() << " "
-                      << color << Color::Bold() << tag << Color::Reset() << " "
-                      << Color::Yellow() << sender << Color::Reset() << ": " << message << std::endl;
+            if (echo) {
+                std::cout << "  " << Color::Dim() << timestamp << Color::Reset() << " "
+                          << color << Color::Bold() << tag << Color::Reset() << " "
+                          << Color::Yellow() << sender << Color::Reset() << ": " << message << std::endl;
+            }
 
             if (log_file.is_open()) {
                 // If another terminal hangs on to the log lock we write anyway
@@ -467,10 +477,6 @@ namespace Toolkit {
             std::cout << Color::Reset() << "\n";
         }
 
-        inline void PrintBreadcrumb(const std::string& path) {
-            std::cout << "  " << Color::Dim() << path << Color::Reset() << "\n\n";
-        }
-
         inline void LoadingDots(const std::string& label, int dots = 3, int delay_ms = 150) {
             std::cout << "  " << Color::Dim() << label << std::flush;
             for (int i = 0; i < dots; ++i) {
@@ -492,7 +498,7 @@ namespace Toolkit {
             std::cout << "\r" << Color::BgRed() << Color::White() << Color::Bold() << text << Color::Reset() << "\n\n";
         }
 
-        inline void PrintHeader(const std::string& title) {
+        inline void PrintHeader(const std::string& title, bool animate = true) {
             int total_width = 83;
             int padding = (total_width - 4 - static_cast<int>(title.length())) / 2;
             std::string left_pad(std::max(0, padding), ' ');
@@ -501,7 +507,7 @@ namespace Toolkit {
             std::cout << Color::Yellow() << Color::Bold() << "+";
             for (int drawn = 0; drawn < total_width - 2; drawn += 9) {
                 std::cout << std::string(std::min(9, total_width - 2 - drawn), '=') << std::flush;
-                std::this_thread::sleep_for(std::chrono::milliseconds(12));
+                if (animate) std::this_thread::sleep_for(std::chrono::milliseconds(12));
             }
             std::cout << "+\n"
                       << "| " << left_pad << Color::White() << title << Color::Yellow() << right_pad << " |\n"
@@ -520,6 +526,27 @@ namespace Toolkit {
 
         inline void PrintOption(const std::string& num, const std::string& text) {
             std::cout << "  " << Color::Cyan() << "[" << num << "]" << Color::Reset() << " " << text << "\n";
+        }
+
+        // One-line result of the last action, shown under the screen's status.
+        struct Status {
+            enum class Kind { None, Ok, Info, Warn, Error };
+            Kind kind = Kind::None;
+            std::string text;
+
+            static Status Ok(std::string t)    { return {Kind::Ok, std::move(t)}; }
+            static Status Info(std::string t)  { return {Kind::Info, std::move(t)}; }
+            static Status Warn(std::string t)  { return {Kind::Warn, std::move(t)}; }
+            static Status Error(std::string t) { return {Kind::Error, std::move(t)}; }
+        };
+
+        inline void PrintStatus(const Status& s) {
+            if (s.kind == Status::Kind::None || s.text.empty()) return;
+            std::string color = Color::Cyan();
+            if (s.kind == Status::Kind::Ok)    color = Color::Green();
+            if (s.kind == Status::Kind::Warn)  color = Color::Yellow();
+            if (s.kind == Status::Kind::Error) color = Color::Red();
+            std::cout << "  " << color << Color::Bold() << "> " << Color::Reset() << color << s.text << Color::Reset() << "\n\n";
         }
 
         inline void PrintErrorCard(const std::string& msg) {
@@ -608,11 +635,11 @@ namespace Toolkit {
                 long long val = 0;
                 char extra = 0;
                 if (!(in >> val) || (in >> extra)) {
-                    PrintErrorCard("Please type a whole number.");
+                    PrintErrorCard("Invalid input. Enter a whole number.");
                     continue;
                 }
                 if (val < min_val || val > max_val) {
-                    PrintErrorCard("Pick something between " + std::to_string(min_val) + " and " + std::to_string(max_val) + ".");
+                    PrintErrorCard("Enter a value from " + std::to_string(min_val) + " to " + std::to_string(max_val) + ".");
                     continue;
                 }
                 return static_cast<int>(val);
@@ -620,7 +647,7 @@ namespace Toolkit {
         }
 
         inline void Pause() {
-            ReadLine("\n" + Color::Yellow() + "  Press ENTER to go back..." + Color::Reset());
+            ReadLine("\n" + Color::Dim() + "  Press Enter to continue." + Color::Reset());
         }
     }
 }
@@ -782,19 +809,19 @@ namespace Toolkit {
             {
                 CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
                 if (!lock.held()) {
-                    error = "the shared state is locked by another terminal and didn't free up";
+                    error = "shared state is locked by another terminal";
                     closeAll();
                     return false;
                 }
                 if (block_->magic != kMagic) {
                     initialise(capacity_hint);
                 } else if (block_->layout_size != sizeof(SharedBlock)) {
-                    error = "another terminal is running a different build of this program, close it first";
+                    error = "another terminal is running a different version; close it and try again";
                     closeAll();
                     return false;
                 }
                 if (!openSemaphoresLocked()) {
-                    error = "couldn't create the shared semaphores";
+                    error = "could not create shared semaphores";
                     closeAll();
                     return false;
                 }
@@ -805,7 +832,7 @@ namespace Toolkit {
             {
                 CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
                 if (!lock.held()) {
-                    error = "the shared state is locked by another terminal and didn't free up";
+                    error = "shared state is locked by another terminal";
                     closeAll();
                     return false;
                 }
@@ -816,7 +843,7 @@ namespace Toolkit {
                     if (d.terminals[i].pid == 0) { my_index_ = i; break; }
                 }
                 if (my_index_ < 0) {
-                    error = "all " + std::to_string(kMaxTerminals) + " terminal slots are in use";
+                    error = "all " + std::to_string(kMaxTerminals) + " terminal limit reached";
                     closeAll();
                     return false;
                 }
@@ -831,7 +858,7 @@ namespace Toolkit {
                 }
 
                 d.terminals[my_index_] = TerminalSlot{pid_, number_, stamp_, 0, 0, kNotWaiting};
-                logActivityLocked("joined");
+                logActivityLocked("connected");
             }
 
             stop_reaper_ = false;
@@ -850,7 +877,7 @@ namespace Toolkit {
                 if (lock.held()) {
                     SharedData& d = block_->data;
                     d.terminals[my_index_] = TerminalSlot{};
-                    logActivityLocked("left");
+                    logActivityLocked("disconnected");
                     last = true;
                     for (const auto& t : d.terminals) {
                         if (t.pid != 0) { last = false; break; }
@@ -874,8 +901,8 @@ namespace Toolkit {
         // Drops any read or write hold this terminal still has. Safe to call
         // any time; used on the way out and after unexpected errors.
         void releaseHeld() {
-            if (writing_) endWrite(0, false, 0);
-            if (reading_) endRead(0);
+            if (writing_) endWrite(false, 0);
+            if (reading_) endRead();
         }
 
         Snapshot snapshot() {
@@ -922,8 +949,8 @@ namespace Toolkit {
 
         // ---- producer-consumer --------------------------------------------
 
-        OpResult produce(int producer_id, int value, int timeout_ms) {
-            if (!block_) return OpResult::Failed("not connected to the shared session");
+        OpResult produce(int value, int timeout_ms) {
+            if (!block_) return OpResult::Failed("Not connected to the shared session.");
             if (!setWaiting(kWaitProduce)) return busyResult();
 
             // Classic order: wait(empty) -> lock -> add item -> unlock -> signal(full)
@@ -939,31 +966,30 @@ namespace Toolkit {
                 d.terminals[my_index_].waiting = kNotWaiting;
 
                 if (r == ipc::WaitResult::TimedOut)
-                    return OpResult::TimedOut("The buffer stayed full the whole time. Consume something first (here or in another terminal).");
+                    return OpResult::TimedOut("Timed out. The buffer is full; consume an item to free a slot.");
                 if (r != ipc::WaitResult::Acquired)
-                    return OpResult::Failed("Waiting on the empty-slot semaphore failed.");
+                    return OpResult::Failed("Could not wait on the empty-slot semaphore.");
 
                 if (d.count >= d.capacity) {
                     // The semaphore let us in but the buffer is full. That should
                     // never happen; keep the data safe and don't pass the bad token on.
-                    logActivityLocked("buffer/semaphore mismatch on produce, item dropped");
-                    return OpResult::Failed("The buffer and its semaphore disagree, so the item was not added.");
+                    logActivityLocked("buffer inconsistency detected on produce");
+                    return OpResult::Failed("Buffer state is inconsistent. The item was not added.");
                 }
 
                 d.items[d.rear] = value;
                 d.rear = (d.rear + 1) % d.capacity;
                 d.count++;
                 d.produced++;
-                logActivityLocked("producer " + std::to_string(producer_id) + " added " + std::to_string(value));
-                result = OpResult::Ok(value, "Added " + std::to_string(value) + " to the buffer (" +
-                                             std::to_string(d.count) + "/" + std::to_string(d.capacity) + ").");
+                logActivityLocked("produced " + std::to_string(value));
+                result = OpResult::Ok(value, "You produced " + std::to_string(value) + ".");
             }
             full_.post();
             return result;
         }
 
-        OpResult consume(int consumer_id, int timeout_ms) {
-            if (!block_) return OpResult::Failed("not connected to the shared session");
+        OpResult consume(int timeout_ms) {
+            if (!block_) return OpResult::Failed("Not connected to the shared session.");
             if (!setWaiting(kWaitConsume)) return busyResult();
 
             // Classic order: wait(full) -> lock -> take item -> unlock -> signal(empty)
@@ -979,22 +1005,21 @@ namespace Toolkit {
                 d.terminals[my_index_].waiting = kNotWaiting;
 
                 if (r == ipc::WaitResult::TimedOut)
-                    return OpResult::TimedOut("The buffer stayed empty the whole time. Produce something first (here or in another terminal).");
+                    return OpResult::TimedOut("Timed out. The buffer is empty; produce an item first.");
                 if (r != ipc::WaitResult::Acquired)
-                    return OpResult::Failed("Waiting on the full-slot semaphore failed.");
+                    return OpResult::Failed("Could not wait on the full-slot semaphore.");
 
                 if (d.count <= 0) {
-                    logActivityLocked("buffer/semaphore mismatch on consume, nothing taken");
-                    return OpResult::Failed("The buffer and its semaphore disagree, so nothing was taken.");
+                    logActivityLocked("buffer inconsistency detected on consume");
+                    return OpResult::Failed("Buffer state is inconsistent. No item was consumed.");
                 }
 
                 int item = d.items[d.front];
                 d.front = (d.front + 1) % d.capacity;
                 d.count--;
                 d.consumed++;
-                logActivityLocked("consumer " + std::to_string(consumer_id) + " took " + std::to_string(item));
-                result = OpResult::Ok(item, "Took " + std::to_string(item) + " from the buffer (" +
-                                            std::to_string(d.count) + "/" + std::to_string(d.capacity) + " left).");
+                logActivityLocked("consumed " + std::to_string(item));
+                result = OpResult::Ok(item, "You consumed " + std::to_string(item) + ".");
             }
             empty_.post();
             return result;
@@ -1003,45 +1028,45 @@ namespace Toolkit {
         // Only allowed while the buffer is empty and nobody is waiting on it,
         // because the empty-slot semaphore has to be topped up or drained to match.
         OpResult resizeBuffer(int new_capacity) {
-            if (!block_) return OpResult::Failed("not connected to the shared session");
+            if (!block_) return OpResult::Failed("Not connected to the shared session.");
             new_capacity = std::max(1, std::min(kMaxBufferSize, new_capacity));
 
             CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
             if (!lock.held()) return busyResult();
             SharedData& d = block_->data;
 
-            if (d.capacity == new_capacity) return OpResult::Ok(new_capacity, "The buffer already has that size.");
+            if (d.capacity == new_capacity) return OpResult::Ok(new_capacity, "Buffer size unchanged.");
             if (d.count != 0)
-                return OpResult::Failed("The shared buffer still has " + std::to_string(d.count) + " item(s). Empty it before resizing.");
+                return OpResult::Failed("Buffer must be empty to resize (" + std::to_string(d.count) + " item(s) remaining).");
             for (const auto& t : d.terminals) {
                 if (t.pid != 0 && (t.waiting == kWaitProduce || t.waiting == kWaitConsume))
-                    return OpResult::Failed("Terminal " + std::to_string(t.number) + " is waiting on the buffer right now. Try again in a moment.");
+                    return OpResult::Failed("Terminal " + std::to_string(t.number) + " is waiting on the buffer. Try again shortly.");
             }
 
             int old_capacity = d.capacity;
             if (new_capacity > old_capacity) {
                 if (!empty_.post(new_capacity - old_capacity))
-                    return OpResult::Failed("Couldn't adjust the empty-slot semaphore.");
+                    return OpResult::Failed("Could not update the empty-slot semaphore.");
             } else {
                 int needed = old_capacity - new_capacity, taken = 0;
                 while (taken < needed && empty_.wait(0) == ipc::WaitResult::Acquired) ++taken;
                 if (taken < needed) {
                     if (taken > 0) empty_.post(taken);
-                    return OpResult::Failed("Couldn't shrink the empty-slot semaphore safely, size left as it was.");
+                    return OpResult::Failed("Could not resize the buffer safely. Size unchanged.");
                 }
             }
 
             d.capacity = new_capacity;
             d.front = d.rear = 0;
-            logActivityLocked("resized the buffer to " + std::to_string(new_capacity));
-            return OpResult::Ok(new_capacity, "Shared buffer resized to " + std::to_string(new_capacity) + " slots.");
+            logActivityLocked("set buffer size to " + std::to_string(new_capacity));
+            return OpResult::Ok(new_capacity, "Buffer size set to " + std::to_string(new_capacity) + ".");
         }
 
         // ---- readers-writers (readers get priority) ------------------------
 
-        OpResult beginRead(int reader_id, int timeout_ms) {
-            if (!block_) return OpResult::Failed("not connected to the shared session");
-            if (reading_ || writing_) return OpResult::Failed("This terminal is already using the database.");
+        OpResult beginRead(int timeout_ms) {
+            if (!block_) return OpResult::Failed("Not connected to the shared session.");
+            if (reading_ || writing_) return OpResult::Failed("This terminal already holds a database lock.");
             if (!setWaiting(kWaitRead)) return busyResult();
 
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -1052,7 +1077,7 @@ namespace Toolkit {
                 CrossLock rc(rc_lock_, block_->rc_owner, timeout_ms);
                 if (!rc.held()) {
                     clearWaiting();
-                    return OpResult::TimedOut("Another reader is queued behind a writer. Gave up waiting for the read-count lock.");
+                    return OpResult::TimedOut("Timed out waiting for read access.");
                 }
                 recovered = rc.recovered();
 
@@ -1064,8 +1089,8 @@ namespace Toolkit {
                     if (r != ipc::WaitResult::Acquired) {
                         clearWaiting();
                         if (r == ipc::WaitResult::TimedOut)
-                            return OpResult::TimedOut("A writer kept the database locked the whole time.");
-                        return OpResult::Failed("Waiting on the database semaphore failed.");
+                            return OpResult::TimedOut("Timed out. A writer is holding the database.");
+                        return OpResult::Failed("Could not wait on the database semaphore.");
                     }
                 }
                 d.read_count++;
@@ -1082,18 +1107,18 @@ namespace Toolkit {
                 me.reading = 1;
                 d.reads++;
                 value = d.db_value;
-                logActivityLocked("reader " + std::to_string(reader_id) + " started reading (" + std::to_string(value) + ")");
+                logActivityLocked("started reading (value " + std::to_string(value) + ")");
             }
             reading_ = true;
-            return OpResult::Ok(value, recovered ? "Recovered a lock left behind by a closed terminal." : "");
+            return OpResult::Ok(value, recovered ? "Recovered a lock held by a closed terminal." : "");
         }
 
-        OpResult endRead(int reader_id) {
-            if (!block_ || !reading_) return OpResult::Failed("This terminal isn't reading.");
+        OpResult endRead() {
+            if (!block_ || !reading_) return OpResult::Failed("No read lock is held.");
             SharedData& d = block_->data;
             {
                 CrossLock rc(rc_lock_, block_->rc_owner, kReleaseLockMs);
-                if (!rc.held()) return OpResult::Failed("Couldn't get the read-count lock to finish reading. Try again.");
+                if (!rc.held()) return OpResult::Failed("Could not release the read lock. Try again.");
 
                 if (d.read_count > 0) {
                     d.read_count--;
@@ -1103,16 +1128,16 @@ namespace Toolkit {
                 CrossLock state(state_lock_, block_->state_owner, kStateLockMs);
                 if (state.held()) {
                     d.terminals[my_index_].reading = 0;
-                    logActivityLocked("reader " + std::to_string(reader_id) + " finished reading");
+                    logActivityLocked("finished reading");
                 }
             }
             reading_ = false;
             return OpResult::Ok();
         }
 
-        OpResult beginWrite(int writer_id, int timeout_ms) {
-            if (!block_) return OpResult::Failed("not connected to the shared session");
-            if (reading_ || writing_) return OpResult::Failed("This terminal is already using the database.");
+        OpResult beginWrite(int timeout_ms) {
+            if (!block_) return OpResult::Failed("Not connected to the shared session.");
+            if (reading_ || writing_) return OpResult::Failed("This terminal already holds a database lock.");
             if (!setWaiting(kWaitWrite)) return busyResult();
 
             ipc::WaitResult r = wrt_.wait(timeout_ms);
@@ -1125,19 +1150,19 @@ namespace Toolkit {
             d.terminals[my_index_].waiting = kNotWaiting;
 
             if (r == ipc::WaitResult::TimedOut)
-                return OpResult::TimedOut("Readers or another writer kept the database busy the whole time.");
+                return OpResult::TimedOut("Timed out. The database is in use by readers or another writer.");
             if (r != ipc::WaitResult::Acquired)
-                return OpResult::Failed("Waiting on the database semaphore failed.");
+                return OpResult::Failed("Could not wait on the database semaphore.");
 
             d.writer_terminal = number_;
             d.terminals[my_index_].writing = 1;
-            logActivityLocked("writer " + std::to_string(writer_id) + " locked the database");
+            logActivityLocked("started writing");
             writing_ = true;
             return OpResult::Ok(d.db_value);
         }
 
-        OpResult endWrite(int writer_id, bool commit, int value) {
-            if (!block_ || !writing_) return OpResult::Failed("This terminal isn't writing.");
+        OpResult endWrite(bool commit, int value) {
+            if (!block_ || !writing_) return OpResult::Failed("No write lock is held.");
             OpResult result = OpResult::Ok(value);
             {
                 CrossLock lock(state_lock_, block_->state_owner, kReleaseLockMs);
@@ -1149,10 +1174,9 @@ namespace Toolkit {
                     }
                     d.writer_terminal = 0;
                     d.terminals[my_index_].writing = 0;
-                    logActivityLocked(commit ? "writer " + std::to_string(writer_id) + " wrote " + std::to_string(value)
-                                             : "writer " + std::to_string(writer_id) + " left without writing");
+                    logActivityLocked(commit ? "wrote " + std::to_string(value) : "cancelled the write");
                 } else if (commit) {
-                    result = OpResult::Failed("Couldn't save the value because the shared state stayed locked.");
+                    result = OpResult::Failed("Could not save the value. Shared state is locked.");
                 }
             }
             // Always give the database back, even if saving failed.
@@ -1168,18 +1192,18 @@ namespace Toolkit {
         }
 
         static OpResult busyResult() {
-            return OpResult::Failed("The shared state is busy (another terminal may have frozen). Try again.");
+            return OpResult::Failed("Shared state is busy. Try again.");
         }
 
         bool openBlock(std::string& error, bool allow_reset) {
             if (!state_lock_.open("state") || !rc_lock_.open("readcount")) {
-                error = "couldn't create the shared locks";
+                error = "could not create shared locks";
                 closeAll();
                 return false;
             }
             bool created = false;
             if (!memory_.open("shared", sizeof(SharedBlock), created)) {
-                error = "couldn't map the shared memory (an older build may still be running)";
+                error = "could not open shared memory (an older version may still be running)";
                 closeAll();
                 return false;
             }
@@ -1304,7 +1328,7 @@ namespace Toolkit {
                     if (t.pid == 0 || t.pid == pid_ || ipc::isAlive(t.pid, t.stamp)) continue;
                     orphans.push_back({t.reading != 0, t.writing != 0});
                     if (t.writing && d.writer_terminal == t.number) d.writer_terminal = 0;
-                    logActivityLocked("terminal " + std::to_string(t.number) + " went away, released its locks");
+                    logActivityLocked("terminal " + std::to_string(t.number) + " disconnected; locks released");
                     t = TerminalSlot{};
                 }
             }
@@ -1359,55 +1383,8 @@ namespace Toolkit {
     struct ProblemConfig {
         int buffer_capacity = 5;
         int num_philosophers = 5;
-        int philosopher_strategy = 1;
-        int wait_seconds = 20;   // how long a blocked producer/consumer/reader/writer waits
+        int wait_seconds = 20;   // how long a blocked action waits before giving up
     };
-
-    class ConfigManager {
-    private:
-        ProblemConfig config;
-
-    public:
-        ProblemConfig& getConfig() { return config; }
-        const ProblemConfig& getConfig() const { return config; }
-
-        void configureAll() {
-            UI::PrintHeader("SETTINGS");
-            UI::PrintBreadcrumb("Main menu > Settings");
-
-            std::cout << "  Producer-consumer\n";
-            int capacity = UI::SafeReadInt("  Buffer size (1-100): ", 1, kMaxBufferSize);
-
-            std::cout << "\n  Waiting\n";
-            config.wait_seconds = UI::SafeReadInt("  How long to wait for a busy resource, in seconds (1-120): ", 1, 120);
-
-            std::cout << "\n  Dining philosophers\n";
-            config.num_philosophers = UI::SafeReadInt("  Number of philosophers (2-20): ", 2, 20);
-
-            std::cout << "  Deadlock avoidance strategy:\n"
-                      << "    1. Resource hierarchy (pick up the lower-numbered fork first)\n"
-                      << "    2. Room semaphore (at most N-1 at the table)\n";
-            config.philosopher_strategy = UI::SafeReadInt("  Choice (1-2): ", 1, 2);
-
-            UI::ProgressBarAnimation("Saving", 400);
-
-            config.buffer_capacity = capacity;
-            if (g_Session.isAttached()) {
-                OpResult r = g_Session.resizeBuffer(capacity);
-                if (!r.ok()) {
-                    UI::PrintWarningCard(r.message + " Your other settings were saved.");
-                    return;
-                }
-            }
-
-            std::cout << Color::Green() << "\n  ";
-            UI::TypeText("Settings saved.", 12);
-            std::cout << "\n" << Color::Reset();
-        }
-    };
-}
-
-namespace Toolkit {
 
     struct BenchmarkResult {
         std::string problem_name;
@@ -1422,7 +1399,7 @@ namespace Toolkit {
 
     class PerformanceAnalyzer {
     private:
-        std::vector<BenchmarkResult> benchmark_history;
+        std::vector<BenchmarkResult> history;
         std::mutex history_mutex;
 
         // Quote a CSV field and double any quotes inside it.
@@ -1438,84 +1415,69 @@ namespace Toolkit {
     public:
         void recordResult(const BenchmarkResult& result) {
             std::lock_guard<std::mutex> lock(history_mutex);
-            benchmark_history.push_back(result);
+            history.push_back(result);
         }
 
-        void displaySummaryTable() {
+        void printTable(bool animate) {
             std::lock_guard<std::mutex> lock(history_mutex);
-            UI::PrintHeader("SESSION REPORT");
-            UI::PrintBreadcrumb("Main menu > Report");
 
-            if (benchmark_history.empty()) {
-                std::cout << Color::Yellow() << "  Nothing recorded yet. Try one of the problems first.\n" << Color::Reset();
+            if (history.empty()) {
+                std::cout << "  " << Color::Dim() << "No activity recorded in this session." << Color::Reset() << "\n\n";
                 return;
             }
 
             std::cout << Color::Bold() << std::left
-                      << std::setw(22) << "  Problem"
-                      << std::setw(25) << "Approach"
-                      << std::setw(10) << "Safe"
-                      << std::setw(14) << "Actions"
-                      << std::setw(16) << "Blocked"
-                      << std::setw(14) << "Integrity"
-                      << "\n" << Color::Reset();
+                      << "  " << std::setw(22) << "Problem"
+                      << std::setw(26) << "Method"
+                      << std::setw(8) << "Safe"
+                      << std::setw(12) << "Actions"
+                      << std::setw(12) << "Blocked"
+                      << "Integrity" << Color::Reset() << "\n";
+            std::cout << "  " << std::string(89, '-') << "\n";
 
-            std::cout << "  " << std::string(100, '-') << "\n";
-
-            for (const auto& res : benchmark_history) {
-                std::string safe_str = res.is_safe_implementation ? (Color::Green() + "yes" + Color::Reset())
-                                                                  : (Color::Red() + "no" + Color::Reset());
-                std::string integrity_str = res.data_integrity_passed ? (Color::Green() + "ok" + Color::Reset())
-                                                                      : (Color::Red() + "broken" + Color::Reset());
-
-                std::cout << std::left
-                          << "  " << std::setw(20) << res.problem_name
-                          << std::setw(25) << res.strategy_name
-                          << std::setw(10 + static_cast<int>(safe_str.size()) - (res.is_safe_implementation ? 3 : 2)) << safe_str
-                          << std::setw(14) << res.total_operations
-                          << std::setw(16) << res.wait_contention_count
-                          << integrity_str
+            for (const auto& res : history) {
+                std::string safe = res.is_safe_implementation ? "Yes" : "No";
+                std::string integrity = res.data_integrity_passed ? "Passed" : "Failed";
+                std::cout << "  " << std::setw(22) << res.problem_name
+                          << std::setw(26) << res.strategy_name
+                          << (res.is_safe_implementation ? Color::Green() : Color::Red()) << std::setw(8) << safe << Color::Reset()
+                          << std::setw(12) << res.total_operations
+                          << std::setw(12) << res.wait_contention_count
+                          << (res.data_integrity_passed ? Color::Green() : Color::Red()) << integrity << Color::Reset()
                           << "\n" << std::flush;
-                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                if (animate) std::this_thread::sleep_for(std::chrono::milliseconds(60));
             }
-            std::cout << "  " << std::string(100, '-') << "\n";
+            std::cout << "\n";
         }
 
-        void exportCSVReport(const std::string& filename = "benchmark_report.csv") {
+        UI::Status exportCSV(const std::string& filename = "benchmark_report.csv") {
             std::lock_guard<std::mutex> lock(history_mutex);
-            UI::PrintHeader("EXPORT CSV");
-            UI::PrintBreadcrumb("Main menu > Export CSV");
+            if (history.empty()) return UI::Status::Warn("Nothing to export yet.");
 
-            UI::ProgressBarAnimation("Writing " + filename, 500);
+            UI::ProgressBarAnimation("Exporting", 400);
 
             std::ofstream file(filename);
             if (!file.is_open()) {
-                g_Logger.log(Logger::Level::ERROR, "report", "couldn't open " + filename + " for writing");
-                UI::PrintErrorCard("Couldn't create " + filename + ". Is it open in another program?");
-                return;
+                g_Logger.log(Logger::Level::ERROR, "report", "could not open " + filename);
+                return UI::Status::Error("Could not write " + filename + ". Close it if it is open in another program.");
             }
 
-            file << "Problem,Approach,Safe,Actions,Blocked,Integrity,TimeMs,Notes\n";
-            for (const auto& res : benchmark_history) {
+            file << "Problem,Method,Safe,Actions,Blocked,Integrity,DurationMs,Notes\n";
+            for (const auto& res : history) {
                 file << csvField(res.problem_name) << ","
                      << csvField(res.strategy_name) << ","
-                     << (res.is_safe_implementation ? "yes" : "no") << ","
+                     << (res.is_safe_implementation ? "Yes" : "No") << ","
                      << res.total_operations << ","
                      << res.wait_contention_count << ","
-                     << (res.data_integrity_passed ? "ok" : "broken") << ","
+                     << (res.data_integrity_passed ? "Passed" : "Failed") << ","
                      << static_cast<long long>(res.execution_time_ms) << ","
                      << csvField(res.notes) << "\n";
             }
             file.close();
-            if (!file) {
-                UI::PrintErrorCard("Something went wrong while writing " + filename + ".");
-                return;
-            }
+            if (!file) return UI::Status::Error("An error occurred while writing " + filename + ".");
 
-            std::cout << Color::Green() << "\n  ";
-            UI::TypeText("Saved to " + filename + ".", 12);
-            std::cout << "\n" << Color::Reset();
             g_Logger.log(Logger::Level::OK, "report", "exported " + filename);
+            return UI::Status::Ok("Report exported to " + filename + ".");
         }
     };
 
@@ -1524,7 +1486,7 @@ namespace Toolkit {
 
 namespace Toolkit {
 
-    // Local buffer, only used by the unsynchronized demo.
+    // Local buffer, used only by the unsynchronized demo.
     template <typename T>
     class CircularBuffer {
     private:
@@ -1555,79 +1517,83 @@ namespace Toolkit {
             return item;
         }
 
-        std::string renderVisualState() const {
-            std::stringstream ss;
-            for (int i = 0; i < capacity; ++i) {
-                bool filled = ((i - front + capacity) % capacity) < count;
-                if (filled) ss << Color::Green() << Color::Bold() << "[" << std::right << std::setw(4) << buffer[i] << std::left << "]" << Color::Reset();
-                else        ss << Color::Dim() << "[    ]" << Color::Reset();
-                ss << " ";
-            }
-            ss << " " << count << "/" << capacity;
-            return ss.str();
-        }
+        int size() const { return count; }
+        int cap() const { return capacity; }
+        bool filled(int i) const { return ((i - front + capacity) % capacity) < count; }
+        const T& at(int i) const { return buffer[i]; }
     };
 
     namespace View {
 
-        inline void PrintSharedBuffer(const SharedSession::Snapshot& s) {
-            std::cout << "  " << Color::Bold() << "Shared buffer" << Color::Reset()
-                      << "  " << s.count << " of " << s.capacity << " slots used\n";
-            for (int i = 0; i < s.capacity; ++i) {
-                if (i % 10 == 0) std::cout << (i ? "\n    " : "    ");
-                bool filled = ((i - s.front + s.capacity) % s.capacity) < s.count;
-                if (filled) std::cout << Color::Green() << Color::Bold() << "[" << std::right << std::setw(4) << s.items[i] << std::left << "]" << Color::Reset() << " ";
-                else        std::cout << Color::Dim() << "[    ]" << Color::Reset() << " ";
+        // Draws buffer slots, ten per row: [  42] for an item, [    ] for empty.
+        template <typename Filled, typename ValueAt>
+        inline void PrintSlots(int capacity, Filled filled, ValueAt value_at) {
+            for (int i = 0; i < capacity; ++i) {
+                std::cout << (i % 10 == 0 ? (i ? "\n  " : "  ") : " ");
+                if (filled(i)) std::cout << Color::Green() << Color::Bold() << "[" << std::right << std::setw(4) << value_at(i) << std::left << "]" << Color::Reset();
+                else           std::cout << Color::Dim() << "[    ]" << Color::Reset();
             }
-            std::cout << "\n  " << Color::Dim()
-                      << "produced " << s.produced << ", consumed " << s.consumed
-                      << "  |  waiting: " << s.waiting_producers << " producer(s), " << s.waiting_consumers << " consumer(s)"
-                      << "  |  " << s.terminals_online << " terminal(s) online"
-                      << Color::Reset() << "\n";
+            std::cout << "\n";
         }
 
-        inline void PrintDatabase(const SharedSession::Snapshot& s) {
-            std::cout << "  " << Color::Bold() << "Shared database" << Color::Reset()
-                      << "  value = " << Color::Green() << Color::Bold() << s.db_value << Color::Reset()
-                      << "  |  reading now: " << s.active_readers
-                      << "  |  writer: " << (s.writer_terminal ? "terminal " + std::to_string(s.writer_terminal) : std::string("none")) << "\n";
-            std::cout << "  " << Color::Dim()
-                      << "reads " << s.reads << ", writes " << s.writes
-                      << "  |  waiting: " << s.waiting_readers << " reader(s), " << s.waiting_writers << " writer(s)"
-                      << "  |  " << s.terminals_online << " terminal(s) online"
-                      << Color::Reset() << "\n";
+        inline void PrintLabel(const std::string& label, const std::string& value) {
+            std::cout << "  " << Color::Dim() << std::left << std::setw(12) << label << Color::Reset() << value << "\n";
         }
 
         inline void PrintActivity(const SharedSession::Snapshot& s) {
-            std::cout << "\n  " << Color::Bold() << "Recent activity" << Color::Reset() << Color::Dim() << "  (all terminals)" << Color::Reset() << "\n";
+            std::cout << "\n  " << Color::Bold() << "Activity" << Color::Reset() << "\n";
             if (s.activity.empty()) {
-                std::cout << "    " << Color::Dim() << "nothing yet" << Color::Reset() << "\n";
+                std::cout << "  " << Color::Dim() << "No activity yet." << Color::Reset() << "\n";
                 return;
             }
-            size_t start = s.activity.size() > 5 ? s.activity.size() - 5 : 0;
+            size_t start = s.activity.size() > 4 ? s.activity.size() - 4 : 0;
             for (size_t i = start; i < s.activity.size(); ++i) {
-                std::cout << "    " << Color::Dim() << s.activity[i] << Color::Reset() << "\n";
+                std::cout << "  " << Color::Dim() << s.activity[i] << Color::Reset() << "\n";
             }
         }
 
-        inline void ReportResult(const OpResult& r, const std::string& who, uint64_t& timeouts, uint64_t& failures) {
-            if (r.ok()) {
-                if (!r.message.empty()) g_Logger.log(Logger::Level::OK, who, r.message);
-            } else if (r.status == OpResult::Status::TimedOut) {
-                timeouts++;
-                UI::PrintWarningCard(r.message);
-                g_Logger.log(Logger::Level::WARN, who, "gave up waiting");
-            } else {
-                failures++;
-                UI::PrintErrorCard(r.message);
-                g_Logger.log(Logger::Level::ERROR, who, r.message);
+        inline void PrintActions(const std::vector<std::pair<std::string, std::string>>& actions) {
+            std::cout << "\n ";
+            for (const auto& a : actions) {
+                std::cout << " " << Color::Cyan() << Color::Bold() << "[" << a.first << "]" << Color::Reset() << " " << a.second << "  ";
             }
+            std::cout << "\n\n";
+        }
+
+        inline UI::Status ToStatus(const OpResult& r, uint64_t& timeouts, uint64_t& failures) {
+            if (r.ok()) return UI::Status::Ok(r.message);
+            if (r.status == OpResult::Status::TimedOut) {
+                timeouts++;
+                return UI::Status::Warn(r.message);
+            }
+            failures++;
+            return UI::Status::Error(r.message);
+        }
+
+        inline std::string Plural(int n, const std::string& word) {
+            return std::to_string(n) + " " + word + (n == 1 ? "" : "s");
+        }
+
+        // Header, connection line and a hint when this is the only terminal.
+        inline void PrintSharedTop(const std::string& title, bool first, const SharedSession::Snapshot& snap) {
+            UI::ClearScreen();
+            UI::PrintHeader(title, first);
+            std::cout << "  " << Color::Green() << "Terminal " << g_Session.terminalNumber() << Color::Reset();
+            if (snap.ok) std::cout << Color::Dim() << "   " << Plural(snap.terminals_online, "terminal") << " connected" << Color::Reset();
+            std::cout << "\n";
+            if (snap.ok && snap.terminals_online == 1) {
+                std::cout << "  " << Color::Dim() << "Run the program in another terminal to work on the same data." << Color::Reset() << "\n";
+            }
+            std::cout << "\n";
         }
 
         inline bool RequireSession() {
             if (g_Session.isAttached()) return true;
-            UI::PrintErrorCard("The shared session isn't available: " +
-                               (g_SessionError.empty() ? std::string("unknown reason") : g_SessionError));
+            UI::ClearScreen();
+            UI::PrintHeader("SHARED SESSION UNAVAILABLE");
+            UI::PrintErrorCard("Shared mode is not available: " +
+                               (g_SessionError.empty() ? std::string("unknown error") : g_SessionError) + ".");
+            UI::Pause();
             return false;
         }
     }
@@ -1635,117 +1601,107 @@ namespace Toolkit {
     class ProducerConsumerEngine {
     public:
         static void runInteractiveMode(const ProblemConfig& config) {
-            UI::ClearScreen();
-            UI::PrintHeader("PRODUCER-CONSUMER (SHARED)");
-            UI::PrintBreadcrumb("Main menu > Producer-consumer");
             if (!View::RequireSession()) return;
-
-            std::cout << "  " << Color::Dim() << "Open this program in another terminal to produce and consume on the same buffer.\n"
-                      << "  Producers wait on 'empty', consumers wait on 'full', and a mutex guards the buffer itself."
-                      << Color::Reset() << "\n";
 
             const int timeout_ms = config.wait_seconds * 1000;
             uint64_t done = 0, timeouts = 0, failures = 0;
+            UI::Status status;
+            bool first = true;
             Timer timer;
             timer.start();
 
             for (bool running = true; running; ) {
                 auto snap = g_Session.snapshot();
-                std::cout << "\n";
+                View::PrintSharedTop("PRODUCER-CONSUMER", first, snap);
+                first = false;
+
                 if (snap.ok) {
-                    View::PrintSharedBuffer(snap);
+                    std::cout << "  " << Color::Bold() << "Buffer" << Color::Reset() << "  " << snap.count << " of " << snap.capacity << " slots in use\n";
+                    View::PrintSlots(snap.capacity,
+                                     [&](int i) { return ((i - snap.front + snap.capacity) % snap.capacity) < snap.count; },
+                                     [&](int i) { return snap.items[i]; });
+                    std::cout << "\n";
+                    View::PrintLabel("Produced", std::to_string(snap.produced));
+                    View::PrintLabel("Consumed", std::to_string(snap.consumed));
+                    View::PrintLabel("Waiting", View::Plural(snap.waiting_producers, "producer") + ", " +
+                                                View::Plural(snap.waiting_consumers, "consumer"));
                     View::PrintActivity(snap);
                 } else {
-                    UI::PrintWarningCard("Couldn't read the shared state just now.");
+                    UI::PrintWarningCard("Shared state is temporarily unavailable.");
                 }
-                std::cout << "\n";
-                UI::PrintOption("1", "Produce an item");
-                UI::PrintOption("2", "Consume an item");
-                UI::PrintOption("3", "Refresh");
-                UI::PrintOption("0", "Back to the main menu");
-                std::cout << "\n";
 
-                int option = UI::SafeReadInt("  Choose (0-3): ", 0, 3);
+                std::cout << "\n";
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Produce"}, {"2", "Consume"}, {"3", "Refresh"}, {"0", "Back"}});
+
+                int option = UI::SafeReadInt("  Select: ", 0, 3);
+                status = {};
 
                 if (option == 1) {
-                    int producer_id = UI::SafeReadInt("  Producer id (1-100): ", 1, 100);
-                    int value = UI::SafeReadInt("  Value to add (1-9999): ", 1, 9999);
-                    std::string who = "producer " + std::to_string(producer_id);
-
-                    OpResult r = UI::RunWithSpinner(who + " waiting for an empty slot", timeout_ms,
-                        [&] { return g_Session.produce(producer_id, value, timeout_ms); });
+                    int value = UI::SafeReadInt("  Item value (1-9999): ", 1, 9999);
+                    OpResult r = UI::RunWithSpinner("Waiting for a free slot", timeout_ms,
+                        [&] { return g_Session.produce(value, timeout_ms); });
                     if (r.ok()) done++;
-                    View::ReportResult(r, who, timeouts, failures);
+                    status = View::ToStatus(r, timeouts, failures);
                 } else if (option == 2) {
-                    int consumer_id = UI::SafeReadInt("  Consumer id (1-100): ", 1, 100);
-                    std::string who = "consumer " + std::to_string(consumer_id);
-
-                    OpResult r = UI::RunWithSpinner(who + " waiting for an item", timeout_ms,
-                        [&] { return g_Session.consume(consumer_id, timeout_ms); });
+                    OpResult r = UI::RunWithSpinner("Waiting for an item", timeout_ms,
+                        [&] { return g_Session.consume(timeout_ms); });
                     if (r.ok()) done++;
-                    View::ReportResult(r, who, timeouts, failures);
-                } else if (option == 3) {
-                    UI::LoadingDots("Refreshing", 3, 80);
-                } else {
+                    status = View::ToStatus(r, timeouts, failures);
+                } else if (option == 0) {
                     running = false;
                 }
             }
 
             timer.stop();
-
-            BenchmarkResult res;
-            res.problem_name = "Producer-Consumer";
-            res.strategy_name = "Shared semaphores";
-            res.is_safe_implementation = true;
-            res.total_operations = done;
-            res.execution_time_ms = timer.elapsedMilliseconds();
-            res.wait_contention_count = timeouts;
-            res.data_integrity_passed = failures == 0;
-            res.notes = "Buffer shared with other terminals through named semaphores.";
-            g_Analyzer.recordResult(res);
+            g_Analyzer.recordResult({"Producer-Consumer", "Shared semaphores", true, done,
+                                     timer.elapsedMilliseconds(), timeouts, failures == 0,
+                                     "Buffer shared across terminals with named semaphores."});
         }
 
         static void runNaiveInteractiveMode(const ProblemConfig& config) {
-            UI::ClearScreen();
-            UI::PrintHeader("PRODUCER-CONSUMER WITHOUT SYNCHRONIZATION");
-            UI::PrintBreadcrumb("Main menu > Unsafe demos > Producer-consumer");
-
             CircularBuffer<int> buffer(config.buffer_capacity);
-            uint64_t violations = 0;
-            uint64_t ops = 0;
-
+            uint64_t violations = 0, ops = 0;
+            UI::Status status = UI::Status::Info("No semaphores or locks are used here. Try producing into a full buffer.");
+            bool first = true;
             Timer timer;
             timer.start();
 
             for (bool running = true; running; ) {
-                std::cout << "\n  " << Color::Bold() << "Buffer (no locks): " << Color::Reset() << buffer.renderVisualState() << "\n\n";
-                UI::PrintOption("1", "Produce without checking for space");
-                UI::PrintOption("2", "Consume without checking for items");
-                UI::PrintOption("0", "Back");
-                std::cout << "\n";
+                UI::ClearScreen();
+                UI::PrintHeader("PRODUCER-CONSUMER (UNSYNCHRONIZED)", first);
+                first = false;
 
-                int option = UI::SafeReadInt("  Choose (0-2): ", 0, 2);
+                std::cout << "  " << Color::Bold() << "Buffer" << Color::Reset() << "  " << buffer.size() << " of " << buffer.cap() << " slots in use\n";
+                View::PrintSlots(buffer.cap(), [&](int i) { return buffer.filled(i); }, [&](int i) { return buffer.at(i); });
+                std::cout << "\n";
+                View::PrintLabel("Errors", std::to_string(violations));
+                std::cout << "\n";
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Produce"}, {"2", "Consume"}, {"0", "Back"}});
+
+                int option = UI::SafeReadInt("  Select: ", 0, 2);
 
                 if (option == 1) {
-                    int val = UI::SafeReadInt("  Value: ", 1, 9999);
+                    int val = UI::SafeReadInt("  Item value (1-9999): ", 1, 9999);
                     ops++;
                     if (buffer.isFull()) {
                         violations++;
-                        UI::PrintErrorCard("Overflow. Without the 'empty' semaphore nothing stopped the producer from writing past a full buffer.");
+                        status = UI::Status::Error("Buffer overflow. Nothing prevented writing to a full buffer.");
                         g_Logger.log(Logger::Level::ERROR, "producer", "buffer overflow");
                     } else {
                         buffer.push(val);
-                        g_Logger.log(Logger::Level::WARN, "producer", "added " + std::to_string(val) + " without any locking");
+                        status = UI::Status::Warn("Produced " + std::to_string(val) + " without synchronization.");
                     }
                 } else if (option == 2) {
                     ops++;
                     if (buffer.isEmpty()) {
                         violations++;
-                        UI::PrintErrorCard("Underflow. Without the 'full' semaphore the consumer read from an empty buffer.");
+                        status = UI::Status::Error("Buffer underflow. Nothing prevented reading from an empty buffer.");
                         g_Logger.log(Logger::Level::ERROR, "consumer", "buffer underflow");
                     } else {
                         int item = buffer.pop();
-                        g_Logger.log(Logger::Level::WARN, "consumer", "took " + std::to_string(item) + " without any locking");
+                        status = UI::Status::Warn("Consumed " + std::to_string(item) + " without synchronization.");
                     }
                 } else {
                     running = false;
@@ -1753,359 +1709,286 @@ namespace Toolkit {
             }
 
             timer.stop();
-
-            BenchmarkResult res;
-            res.problem_name = "Producer-Consumer";
-            res.strategy_name = "No synchronization";
-            res.is_safe_implementation = false;
-            res.total_operations = ops;
-            res.execution_time_ms = timer.elapsedMilliseconds();
-            res.wait_contention_count = violations;
-            res.data_integrity_passed = (violations == 0);
-            res.notes = "Overflow and underflow triggered by hand.";
-            g_Analyzer.recordResult(res);
+            g_Analyzer.recordResult({"Producer-Consumer", "Unsynchronized", false, ops,
+                                     timer.elapsedMilliseconds(), violations, violations == 0,
+                                     "Overflow and underflow demonstration."});
         }
-    };
-}
-
-namespace Toolkit {
-
-    struct LocalDatabase {
-        int value = 100;
-        int active_readers = 0;
-        int active_writers = 0;
     };
 
     class ReadersWritersEngine {
     public:
         static void runInteractiveMode(const ProblemConfig& config) {
-            UI::ClearScreen();
-            UI::PrintHeader("READERS-WRITERS (SHARED)");
-            UI::PrintBreadcrumb("Main menu > Readers-writers");
             if (!View::RequireSession()) return;
-
-            std::cout << "  " << Color::Dim() << "Open this program in another terminal to share the database. Several readers can\n"
-                      << "  read at once; a writer needs it to itself. Readers have priority, so a steady\n"
-                      << "  stream of readers can keep a writer waiting."
-                      << Color::Reset() << "\n";
 
             const int timeout_ms = config.wait_seconds * 1000;
             uint64_t done = 0, timeouts = 0, failures = 0;
+            UI::Status status;
+            bool first = true;
             Timer timer;
             timer.start();
 
             for (bool running = true; running; ) {
                 auto snap = g_Session.snapshot();
-                std::cout << "\n";
+                View::PrintSharedTop("READERS-WRITERS", first, snap);
+                first = false;
+
                 if (snap.ok) {
-                    View::PrintDatabase(snap);
+                    std::cout << "  " << Color::Bold() << "Database" << Color::Reset() << "\n";
+                    View::PrintLabel("Value", Color::Green() + Color::Bold() + std::to_string(snap.db_value) + Color::Reset());
+                    View::PrintLabel("Readers", std::to_string(snap.active_readers) + " active");
+                    View::PrintLabel("Writer", snap.writer_terminal ? "Terminal " + std::to_string(snap.writer_terminal) : std::string("None"));
+                    View::PrintLabel("Waiting", View::Plural(snap.waiting_readers, "reader") + ", " +
+                                                View::Plural(snap.waiting_writers, "writer"));
                     View::PrintActivity(snap);
                 } else {
-                    UI::PrintWarningCard("Couldn't read the shared state just now.");
+                    UI::PrintWarningCard("Shared state is temporarily unavailable.");
                 }
-                std::cout << "\n";
-                UI::PrintOption("1", "Start reading");
-                UI::PrintOption("2", "Start writing");
-                UI::PrintOption("3", "Refresh");
-                UI::PrintOption("0", "Back to the main menu");
-                std::cout << "\n";
 
-                int option = UI::SafeReadInt("  Choose (0-3): ", 0, 3);
+                std::cout << "\n";
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Read"}, {"2", "Write"}, {"3", "Refresh"}, {"0", "Back"}});
+
+                int option = UI::SafeReadInt("  Select: ", 0, 3);
+                status = {};
 
                 if (option == 1) {
-                    int reader_id = UI::SafeReadInt("  Reader id (1-100): ", 1, 100);
-                    std::string who = "reader " + std::to_string(reader_id);
-
-                    OpResult r = UI::RunWithSpinner(who + " waiting to read", timeout_ms,
-                        [&] { return g_Session.beginRead(reader_id, timeout_ms); });
-                    View::ReportResult(r, who, timeouts, failures);
-                    if (!r.ok()) continue;
-
+                    OpResult r = UI::RunWithSpinner("Waiting for read access", timeout_ms,
+                        [&] { return g_Session.beginRead(timeout_ms); });
+                    if (!r.ok()) {
+                        status = View::ToStatus(r, timeouts, failures);
+                        continue;
+                    }
                     done++;
-                    g_Logger.log(Logger::Level::OK, who, "read value " + std::to_string(r.value));
-                    std::cout << "\n  " << Color::Green() << "You're reading. " << Color::Reset()
-                              << "Other terminals can read as well, but writers will wait until you finish.\n";
-                    UI::ReadLine("  Press ENTER when you're done reading...");
+                    std::cout << "\n  " << Color::Green() << Color::Bold() << "Read lock acquired." << Color::Reset()
+                              << " Value: " << Color::Bold() << r.value << Color::Reset() << "\n"
+                              << "  " << Color::Dim() << "Other readers can join. Writers are blocked until you release." << Color::Reset() << "\n\n";
+                    UI::ReadLine("  Press Enter to release the lock.");
 
-                    OpResult end = g_Session.endRead(reader_id);
+                    OpResult end = g_Session.endRead();
                     while (!end.ok()) {
                         UI::PrintErrorCard(end.message);
-                        UI::ReadLine("  Press ENTER to try again...");
-                        end = g_Session.endRead(reader_id);
+                        UI::ReadLine("  Press Enter to retry.");
+                        end = g_Session.endRead();
                     }
-                    g_Logger.log(Logger::Level::INFO, who, "finished reading");
+                    status = UI::Status::Ok("Read lock released.");
                 } else if (option == 2) {
-                    int writer_id = UI::SafeReadInt("  Writer id (1-100): ", 1, 100);
-                    std::string who = "writer " + std::to_string(writer_id);
+                    OpResult r = UI::RunWithSpinner("Waiting for write access", timeout_ms,
+                        [&] { return g_Session.beginWrite(timeout_ms); });
+                    if (!r.ok()) {
+                        status = View::ToStatus(r, timeouts, failures);
+                        continue;
+                    }
+                    std::cout << "\n  " << Color::Green() << Color::Bold() << "Write lock acquired." << Color::Reset()
+                              << " Current value: " << Color::Bold() << r.value << Color::Reset() << "\n"
+                              << "  " << Color::Dim() << "All other readers and writers are blocked until you finish." << Color::Reset() << "\n\n";
+                    int value = UI::SafeReadInt("  New value (1-9999, 0 to cancel): ", 0, 9999);
 
-                    OpResult r = UI::RunWithSpinner(who + " waiting for the database", timeout_ms,
-                        [&] { return g_Session.beginWrite(writer_id, timeout_ms); });
-                    View::ReportResult(r, who, timeouts, failures);
-                    if (!r.ok()) continue;
-
-                    std::cout << "\n  " << Color::Green() << "The database is yours. " << Color::Reset()
-                              << "Current value is " << r.value << ". Everyone else waits until you're done.\n";
-                    int value = UI::SafeReadInt("  New value (1-9999, or 0 to cancel): ", 0, 9999);
-
-                    OpResult end = g_Session.endWrite(writer_id, value != 0, value);
+                    OpResult end = g_Session.endWrite(value != 0, value);
                     if (!end.ok()) {
                         failures++;
-                        UI::PrintErrorCard(end.message);
+                        status = UI::Status::Error(end.message);
                     } else if (value != 0) {
                         done++;
-                        g_Logger.log(Logger::Level::OK, who, "wrote " + std::to_string(value));
+                        status = UI::Status::Ok("Value updated to " + std::to_string(value) + ".");
                     } else {
-                        g_Logger.log(Logger::Level::INFO, who, "cancelled, nothing written");
+                        status = UI::Status::Info("Write cancelled. No changes made.");
                     }
-                } else if (option == 3) {
-                    UI::LoadingDots("Refreshing", 3, 80);
-                } else {
+                } else if (option == 0) {
                     running = false;
                 }
             }
 
             timer.stop();
-
-            BenchmarkResult res;
-            res.problem_name = "Readers-Writers";
-            res.strategy_name = "Shared, reader priority";
-            res.is_safe_implementation = true;
-            res.total_operations = done;
-            res.execution_time_ms = timer.elapsedMilliseconds();
-            res.wait_contention_count = timeouts;
-            res.data_integrity_passed = failures == 0;
-            res.notes = "Database shared with other terminals; read count lock plus write semaphore.";
-            g_Analyzer.recordResult(res);
+            g_Analyzer.recordResult({"Readers-Writers", "Shared, reader priority", true, done,
+                                     timer.elapsedMilliseconds(), timeouts, failures == 0,
+                                     "Database shared across terminals with a read-count lock and write semaphore."});
         }
 
         static void runNaiveInteractiveMode() {
-            UI::ClearScreen();
-            UI::PrintHeader("READERS-WRITERS WITHOUT SYNCHRONIZATION");
-            UI::PrintBreadcrumb("Main menu > Unsafe demos > Readers-writers");
-
-            LocalDatabase db;
-            uint64_t conflicts = 0;
-            uint64_t ops = 0;
-
+            int value = 100;
+            uint64_t conflicts = 0, ops = 0;
+            UI::Status status = UI::Status::Info("No locks are used here. Option 3 shows a read during a write.");
+            bool first = true;
             Timer timer;
             timer.start();
 
             for (bool running = true; running; ) {
-                std::cout << "\n  " << Color::Bold() << "Database (no locks): " << Color::Reset()
-                          << "value " << db.value << ", readers " << db.active_readers << ", writers " << db.active_writers << "\n\n";
+                UI::ClearScreen();
+                UI::PrintHeader("READERS-WRITERS (UNSYNCHRONIZED)", first);
+                first = false;
 
-                UI::PrintOption("1", "Read without a lock");
-                UI::PrintOption("2", "Write without a lock");
-                UI::PrintOption("3", "Read while a write is half done");
-                UI::PrintOption("0", "Back");
+                std::cout << "  " << Color::Bold() << "Database" << Color::Reset() << "\n";
+                View::PrintLabel("Value", std::to_string(value));
+                View::PrintLabel("Errors", std::to_string(conflicts));
                 std::cout << "\n";
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Read"}, {"2", "Write"}, {"3", "Read during write"}, {"0", "Back"}});
 
-                int option = UI::SafeReadInt("  Choose (0-3): ", 0, 3);
+                int option = UI::SafeReadInt("  Select: ", 0, 3);
 
                 if (option == 1) {
                     ops++;
-                    g_Logger.log(Logger::Level::INFO, "reader", "read " + std::to_string(db.value));
+                    status = UI::Status::Info("Read value " + std::to_string(value) + ".");
                 } else if (option == 2) {
-                    int val = UI::SafeReadInt("  Value to write: ", 1, 9999);
+                    int val = UI::SafeReadInt("  New value (1-9999): ", 1, 9999);
                     ops++;
-                    db.value = val;
-                    g_Logger.log(Logger::Level::WARN, "writer", "wrote " + std::to_string(val) + " with nothing stopping readers");
+                    value = val;
+                    status = UI::Status::Warn("Wrote " + std::to_string(val) + " with no lock. Readers were not blocked.");
                 } else if (option == 3) {
                     ops += 2;
                     conflicts++;
-                    db.active_writers++;
-                    db.active_readers++;
-                    UI::PrintErrorCard("Dirty read. The reader saw the value while a writer was still changing it.");
-                    g_Logger.log(Logger::Level::ERROR, "reader", "dirty read of " + std::to_string(db.value) + " during a write");
-                    db.active_writers--;
-                    db.active_readers--;
+                    status = UI::Status::Error("Dirty read. The value was read while a write was in progress.");
+                    g_Logger.log(Logger::Level::ERROR, "reader", "dirty read of " + std::to_string(value));
                 } else {
                     running = false;
                 }
             }
 
             timer.stop();
-
-            BenchmarkResult res;
-            res.problem_name = "Readers-Writers";
-            res.strategy_name = "No synchronization";
-            res.is_safe_implementation = false;
-            res.total_operations = ops;
-            res.execution_time_ms = timer.elapsedMilliseconds();
-            res.wait_contention_count = conflicts;
-            res.data_integrity_passed = (conflicts == 0);
-            res.notes = "Dirty reads triggered by hand.";
-            g_Analyzer.recordResult(res);
+            g_Analyzer.recordResult({"Readers-Writers", "Unsynchronized", false, ops,
+                                     timer.elapsedMilliseconds(), conflicts, conflicts == 0,
+                                     "Dirty read demonstration."});
         }
     };
-}
-
-namespace Toolkit {
 
     class DiningPhilosophersEngine {
+    private:
+        static void printTable(int n, const std::vector<bool>& fork_taken, const std::vector<std::string>& state) {
+            std::cout << Color::Bold() << "  " << std::left << std::setw(14) << "Philosopher" << std::setw(12) << "State"
+                      << std::setw(14) << "Left fork" << "Right fork" << Color::Reset() << "\n";
+            for (int i = 0; i < n; ++i) {
+                int l = i, r = (i + 1) % n;
+                auto fork = [&](int f) {
+                    std::string text = std::to_string(f) + (fork_taken[f] ? " in use" : " free");
+                    return (fork_taken[f] ? Color::Red() : Color::Green()) + text + Color::Reset() +
+                           std::string(std::max<int>(1, 14 - static_cast<int>(text.size())), ' ');
+                };
+                std::string st_color = state.empty() ? Color::Reset() : (state[i] == "Eating" ? Color::Green() : Color::Yellow());
+                std::cout << "  " << std::setw(14) << i
+                          << st_color << std::setw(12) << (state.empty() ? "Waiting" : state[i]) << Color::Reset()
+                          << fork(l) << fork(r) << "\n";
+            }
+        }
+
     public:
         static void runInteractiveMode(const ProblemConfig& config) {
-            UI::ClearScreen();
-            UI::PrintHeader("DINING PHILOSOPHERS");
-            UI::PrintBreadcrumb("Main menu > Dining philosophers");
-
             int N = config.num_philosophers;
             std::vector<bool> fork_taken(N, false);
-            std::vector<std::string> phil_state(N, "thinking");
-
-            uint64_t total_meals = 0;
-            uint64_t blocked_fork_pickups = 0;
-
+            std::vector<std::string> phil_state(N, "Thinking");
+            uint64_t meals = 0, blocked = 0;
+            UI::Status status = UI::Status::Info("Pick up the left fork, then the right fork to start eating.");
+            bool first = true;
             Timer timer;
             timer.start();
 
             for (bool running = true; running; ) {
-                std::cout << "\n  " << Color::Bold() << "Table (" << N << " philosophers)" << Color::Reset() << "\n";
-                for (int i = 0; i < N; ++i) {
-                    std::string st_color = (phil_state[i] == "eating") ? Color::Green() : Color::Yellow();
-                    int left_fork = i;
-                    int right_fork = (i + 1) % N;
+                UI::ClearScreen();
+                UI::PrintHeader("DINING PHILOSOPHERS", first);
+                first = false;
 
-                    std::cout << "    Philosopher " << std::right << std::setw(2) << i << std::left << ": "
-                              << st_color << std::setw(10) << phil_state[i] << Color::Reset()
-                              << " fork " << left_fork << ": " << (fork_taken[left_fork] ? Color::Red() + "taken" : Color::Green() + "free ") << Color::Reset()
-                              << "   fork " << right_fork << ": " << (fork_taken[right_fork] ? Color::Red() + "taken" : Color::Green() + "free ") << Color::Reset() << "\n";
+                printTable(N, fork_taken, phil_state);
+                std::cout << "\n";
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Take left fork"}, {"2", "Take right fork"}, {"3", "Release forks"}, {"0", "Back"}});
+
+                int option = UI::SafeReadInt("  Select: ", 0, 3);
+                if (option == 0) { running = false; continue; }
+
+                int p = UI::SafeReadInt("  Philosopher (0-" + std::to_string(N - 1) + "): ", 0, N - 1);
+                int left = p, right = (p + 1) % N;
+                std::string name = "Philosopher " + std::to_string(p);
+
+                if (option == 1) {
+                    UI::SpinnerAnimation("Taking fork " + std::to_string(left));
+                    if (!fork_taken[left]) {
+                        fork_taken[left] = true;
+                        status = UI::Status::Ok(name + " took fork " + std::to_string(left) + ".");
+                    } else {
+                        blocked++;
+                        status = UI::Status::Error("Fork " + std::to_string(left) + " is in use.");
+                    }
+                } else if (option == 2) {
+                    UI::SpinnerAnimation("Taking fork " + std::to_string(right));
+                    if (!fork_taken[left]) {
+                        blocked++;
+                        status = UI::Status::Warn(name + " must take the left fork (" + std::to_string(left) + ") first.");
+                    } else if (fork_taken[right]) {
+                        blocked++;
+                        status = UI::Status::Error("Fork " + std::to_string(right) + " is in use.");
+                    } else {
+                        fork_taken[right] = true;
+                        phil_state[p] = "Eating";
+                        meals++;
+                        status = UI::Status::Ok(name + " is eating.");
+                    }
+                } else if (option == 3) {
+                    fork_taken[left] = false;
+                    fork_taken[right] = false;
+                    phil_state[p] = "Thinking";
+                    status = UI::Status::Ok(name + " released both forks.");
                 }
+            }
+
+            timer.stop();
+            g_Analyzer.recordResult({"Dining Philosophers", "Manual fork control", true, meals,
+                                     timer.elapsedMilliseconds(), blocked, true,
+                                     "All fork actions performed manually."});
+        }
+
+        static void runNaiveInteractiveDeadlockDemo(const ProblemConfig& config) {
+            int N = config.num_philosophers;
+            std::vector<bool> fork_taken(N, false);
+            int held = 0;
+            UI::Status status = UI::Status::Info("Each philosopher takes only the left fork. When all do, no one can eat.");
+            bool first = true;
+            Timer timer;
+            timer.start();
+
+            for (bool running = true; running; ) {
+                UI::ClearScreen();
+                UI::PrintHeader("DINING PHILOSOPHERS (DEADLOCK)", first);
+                first = false;
+
+                printTable(N, fork_taken, {});
                 std::cout << "\n";
-
-                UI::PrintOption("1", "Pick up left fork");
-                UI::PrintOption("2", "Pick up right fork and eat");
-                UI::PrintOption("3", "Put both forks down and think");
-                UI::PrintOption("0", "Back to the main menu");
+                View::PrintLabel("Forks held", std::to_string(held) + " of " + std::to_string(N));
                 std::cout << "\n";
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Take left fork"}, {"2", "All take left fork"}, {"0", "Back"}});
 
-                int option = UI::SafeReadInt("  Choose (0-3): ", 0, 3);
+                int option = UI::SafeReadInt("  Select: ", 0, 2);
 
-                if (option == 0) {
+                if (option == 1) {
+                    int p = UI::SafeReadInt("  Philosopher (0-" + std::to_string(N - 1) + "): ", 0, N - 1);
+                    if (fork_taken[p]) {
+                        status = UI::Status::Warn("Fork " + std::to_string(p) + " is already held.");
+                    } else {
+                        fork_taken[p] = true;
+                        held++;
+                        status = UI::Status::Warn("Philosopher " + std::to_string(p) + " holds fork " + std::to_string(p) +
+                                                  " and waits for fork " + std::to_string((p + 1) % N) + ".");
+                    }
+                } else if (option == 2) {
+                    UI::SpinnerAnimation("All philosophers taking their left fork");
+                    std::fill(fork_taken.begin(), fork_taken.end(), true);
+                    held = N;
+                } else {
                     running = false;
                     continue;
                 }
 
-                int p_id = UI::SafeReadInt("  Which philosopher (0-" + std::to_string(N - 1) + "): ", 0, N - 1);
-                int left_fork = p_id;
-                int right_fork = (p_id + 1) % N;
-                std::string who = "philosopher " + std::to_string(p_id);
-
-                if (option == 1) {
-                    UI::SpinnerAnimation(who + " reaching for fork " + std::to_string(left_fork));
-
-                    if (!fork_taken[left_fork]) {
-                        fork_taken[left_fork] = true;
-                        g_Logger.log(Logger::Level::INFO, who, "picked up left fork " + std::to_string(left_fork));
-                    } else {
-                        blocked_fork_pickups++;
-                        UI::PrintErrorCard("Fork " + std::to_string(left_fork) + " is already being used by a neighbour.");
-                        g_Logger.log(Logger::Level::WARN, who, "left fork " + std::to_string(left_fork) + " is taken");
-                    }
-                } else if (option == 2) {
-                    UI::SpinnerAnimation(who + " reaching for fork " + std::to_string(right_fork));
-
-                    if (fork_taken[left_fork] && !fork_taken[right_fork]) {
-                        fork_taken[right_fork] = true;
-                        phil_state[p_id] = "eating";
-                        total_meals++;
-                        g_Logger.log(Logger::Level::OK, who, "picked up right fork " + std::to_string(right_fork) + " and is eating");
-                    } else if (!fork_taken[left_fork]) {
-                        blocked_fork_pickups++;
-                        UI::PrintWarningCard("Philosopher " + std::to_string(p_id) + " has to pick up the left fork first.");
-                        g_Logger.log(Logger::Level::WARN, who, "tried the right fork before the left one");
-                    } else {
-                        blocked_fork_pickups++;
-                        UI::PrintErrorCard("Fork " + std::to_string(right_fork) + " is taken.");
-                        g_Logger.log(Logger::Level::WARN, who, "right fork " + std::to_string(right_fork) + " is taken");
-                    }
-                } else if (option == 3) {
-                    fork_taken[left_fork] = false;
-                    fork_taken[right_fork] = false;
-                    phil_state[p_id] = "thinking";
-                    g_Logger.log(Logger::Level::INFO, who, "put the forks down and is thinking");
-                }
-            }
-
-            timer.stop();
-
-            BenchmarkResult res;
-            res.problem_name = "Dining Philosophers";
-            res.strategy_name = "Manual fork control";
-            res.is_safe_implementation = true;
-            res.total_operations = total_meals;
-            res.execution_time_ms = timer.elapsedMilliseconds();
-            res.wait_contention_count = blocked_fork_pickups;
-            res.data_integrity_passed = true;
-            res.notes = "Every pickup and release was done by hand.";
-            g_Analyzer.recordResult(res);
-        }
-
-        static void runNaiveInteractiveDeadlockDemo(const ProblemConfig& config) {
-            UI::ClearScreen();
-            UI::PrintHeader("DINING PHILOSOPHERS DEADLOCK");
-            UI::PrintBreadcrumb("Main menu > Unsafe demos > Dining philosophers");
-
-            int N = config.num_philosophers;
-            std::vector<bool> fork_taken(N, false);
-            int left_forks_held = 0;
-
-            Timer timer;
-            timer.start();
-
-            for (bool running = true; running; ) {
-                std::cout << "\n  " << Color::Bold() << "Left forks held: " << Color::Reset()
-                          << Color::Red() << Color::Bold() << left_forks_held << "/" << N << Color::Reset() << "\n\n";
-
-                UI::PrintOption("1", "Make a philosopher pick up only the left fork");
-                UI::PrintOption("2", "Everyone grabs their left fork at once");
-                UI::PrintOption("0", "Back");
-                std::cout << "\n";
-
-                int option = UI::SafeReadInt("  Choose (0-2): ", 0, 2);
-
-                if (option == 1) {
-                    int p_id = UI::SafeReadInt("  Which philosopher (0-" + std::to_string(N - 1) + "): ", 0, N - 1);
-
-                    if (!fork_taken[p_id]) {
-                        fork_taken[p_id] = true;
-                        left_forks_held++;
-                        g_Logger.log(Logger::Level::WARN, "philosopher " + std::to_string(p_id), "holding left fork " + std::to_string(p_id));
-                    } else {
-                        UI::PrintWarningCard("Fork " + std::to_string(p_id) + " is already held.");
-                    }
-
-                    if (left_forks_held == N) {
-                        std::cout << "\n";
-                        UI::BlinkAlert("  DEADLOCK: all " + std::to_string(N) + " philosophers hold a left fork and wait for a right one  ");
-                    }
-                } else if (option == 2) {
-                    UI::SpinnerAnimation("Everyone reaching for their left fork");
-                    for (int i = 0; i < N; ++i) {
-                        fork_taken[i] = true;
-                        g_Logger.log(Logger::Level::WARN, "philosopher " + std::to_string(i),
-                                     "holding fork " + std::to_string(i) + ", waiting for fork " + std::to_string((i + 1) % N));
-                    }
-                    left_forks_held = N;
+                if (held == N) {
                     std::cout << "\n";
-                    UI::BlinkAlert("  DEADLOCK: circular wait, nobody can eat  ");
-                } else {
-                    running = false;
+                    UI::BlinkAlert("  DEADLOCK: every philosopher is waiting for a fork held by a neighbor  ");
+                    status = UI::Status::Error("Deadlock. Circular wait: each philosopher holds one fork and waits for the next.");
+                    g_Logger.log(Logger::Level::ERROR, "philosophers", "deadlock reached");
                 }
             }
 
             timer.stop();
-
-            BenchmarkResult res;
-            res.problem_name = "Dining Philosophers";
-            res.strategy_name = "No ordering (deadlock)";
-            res.is_safe_implementation = false;
-            res.total_operations = left_forks_held;
-            res.execution_time_ms = timer.elapsedMilliseconds();
-            res.wait_contention_count = left_forks_held;
-            res.data_integrity_passed = left_forks_held < N;
-            res.notes = "Circular wait built by hand.";
-            g_Analyzer.recordResult(res);
+            g_Analyzer.recordResult({"Dining Philosophers", "Unordered (deadlock)", false, static_cast<uint64_t>(held),
+                                     timer.elapsedMilliseconds(), static_cast<uint64_t>(held), held < N,
+                                     "Circular wait demonstration."});
         }
     };
 }
@@ -2114,10 +1997,10 @@ namespace Toolkit {
 
     class MainMenu {
     private:
-        ConfigManager config_mgr;
+        ProblemConfig config;
 
-        // Runs one screen and makes sure an unexpected error drops us back at
-        // the menu instead of killing the program while holding a shared lock.
+        // Runs one screen. An unexpected error returns to the menu instead of
+        // ending the program while a shared lock is held.
         template <typename Screen>
         void runScreen(Screen&& screen) {
             try {
@@ -2126,23 +2009,91 @@ namespace Toolkit {
                 throw;
             } catch (const std::exception& e) {
                 g_Session.releaseHeld();
-                UI::PrintErrorCard(std::string("Something went wrong: ") + e.what());
+                UI::PrintErrorCard(std::string("Unexpected error: ") + e.what());
+                UI::Pause();
             }
-            UI::Pause();
+        }
+
+        void unsafeDemos() {
+            UI::ClearScreen();
+            UI::PrintHeader("UNSAFE DEMOS");
+            std::cout << "  " << Color::Dim() << "These run in this terminal only and show what fails without synchronization." << Color::Reset() << "\n\n";
+            UI::PrintMenuCard("1", "Producer-consumer", "Overflow and underflow");
+            UI::PrintMenuCard("2", "Readers-writers", "Dirty read");
+            UI::PrintMenuCard("3", "Dining philosophers", "Deadlock");
+            UI::PrintMenuCard("0", "Back", "");
+            std::cout << "\n";
+
+            int choice = UI::SafeReadInt("  Select: ", 0, 3);
+            if (choice == 1) ProducerConsumerEngine::runNaiveInteractiveMode(config);
+            else if (choice == 2) ReadersWritersEngine::runNaiveInteractiveMode();
+            else if (choice == 3) DiningPhilosophersEngine::runNaiveInteractiveDeadlockDemo(config);
+        }
+
+        void report() {
+            UI::Status status;
+            bool first = true;
+            for (;;) {
+                UI::ClearScreen();
+                UI::PrintHeader("SESSION REPORT", first);
+                g_Analyzer.printTable(first);
+                first = false;
+                UI::PrintStatus(status);
+                View::PrintActions({{"1", "Export to CSV"}, {"0", "Back"}});
+
+                if (UI::SafeReadInt("  Select: ", 0, 1) == 0) return;
+                status = g_Analyzer.exportCSV();
+            }
+        }
+
+        void settings() {
+            UI::Status status;
+            bool first = true;
+            for (;;) {
+                UI::ClearScreen();
+                UI::PrintHeader("SETTINGS", first);
+                first = false;
+
+                UI::PrintMenuCard("1", "Buffer size", std::to_string(config.buffer_capacity) + " slots");
+                UI::PrintMenuCard("2", "Wait timeout", std::to_string(config.wait_seconds) + " seconds");
+                UI::PrintMenuCard("3", "Philosophers", std::to_string(config.num_philosophers));
+                UI::PrintMenuCard("4", "Colors", Color::enable_colors ? "On" : "Off");
+                UI::PrintMenuCard("0", "Back", "");
+                std::cout << "\n";
+                UI::PrintStatus(status);
+
+                int choice = UI::SafeReadInt("  Select: ", 0, 4);
+                if (choice == 0) return;
+
+                if (choice == 1) {
+                    int size = UI::SafeReadInt("  Buffer size (1-100): ", 1, kMaxBufferSize);
+                    if (g_Session.isAttached()) {
+                        OpResult r = g_Session.resizeBuffer(size);
+                        if (!r.ok()) { status = UI::Status::Error(r.message); continue; }
+                    }
+                    config.buffer_capacity = size;
+                    status = UI::Status::Ok("Buffer size set to " + std::to_string(size) + ".");
+                } else if (choice == 2) {
+                    config.wait_seconds = UI::SafeReadInt("  Wait timeout in seconds (1-120): ", 1, 120);
+                    status = UI::Status::Ok("Wait timeout set to " + std::to_string(config.wait_seconds) + " seconds.");
+                } else if (choice == 3) {
+                    config.num_philosophers = UI::SafeReadInt("  Philosophers (2-20): ", 2, 20);
+                    status = UI::Status::Ok("Philosophers set to " + std::to_string(config.num_philosophers) + ".");
+                } else {
+                    Color::enable_colors = !Color::enable_colors;
+                    status = UI::Status::Ok(std::string("Colors turned ") + (Color::enable_colors ? "on." : "off."));
+                }
+            }
         }
 
         void printSessionLine() {
             if (!g_Session.isAttached()) {
-                std::cout << "  " << Color::Yellow() << "Shared mode is off: " << g_SessionError << Color::Reset() << "\n";
+                std::cout << "  " << Color::Yellow() << "Offline: " << g_SessionError << Color::Reset() << "\n\n";
                 return;
             }
             auto snap = g_Session.snapshot();
             std::cout << "  " << Color::Green() << "Terminal " << g_Session.terminalNumber() << Color::Reset();
-            if (snap.ok) {
-                std::cout << Color::Dim() << "  |  " << snap.terminals_online << " terminal(s) connected"
-                          << "  |  buffer " << snap.count << "/" << snap.capacity
-                          << "  |  db value " << snap.db_value << Color::Reset();
-            }
+            if (snap.ok) std::cout << Color::Dim() << "   " << View::Plural(snap.terminals_online, "terminal") << " connected" << Color::Reset();
             std::cout << "\n\n";
         }
 
@@ -2150,12 +2101,15 @@ namespace Toolkit {
         void run() {
             UI::ClearScreen();
             std::cout << "\n";
-            UI::LoadingDots("Connecting to the shared session");
+            UI::LoadingDots("Connecting");
 
-            if (!g_Session.attach(config_mgr.getConfig().buffer_capacity, g_SessionError)) {
-                g_Logger.log(Logger::Level::WARN, "session", "shared mode unavailable: " + g_SessionError);
-            } else {
+            if (g_Session.attach(config.buffer_capacity, g_SessionError)) {
                 g_Logger.setSource("T" + std::to_string(g_Session.terminalNumber()));
+                // Another terminal may have created the buffer with a different size.
+                auto snap = g_Session.snapshot();
+                if (snap.ok) config.buffer_capacity = snap.capacity;
+            } else {
+                g_Logger.log(Logger::Level::WARN, "session", "shared mode unavailable: " + g_SessionError);
             }
 
             bool first_draw = true;
@@ -2166,68 +2120,26 @@ namespace Toolkit {
                 first_draw = false;
 
                 printSessionLine();
-                std::cout << Color::Bold() << "  MAIN MENU\n" << Color::Reset();
-                std::cout << "  " << std::string(79, '-') << "\n";
-
-                UI::PrintMenuCard("1", "Producer-consumer", "Shared bounded buffer, works across terminals");
-                UI::PrintMenuCard("2", "Readers-writers", "Shared database, works across terminals");
-                UI::PrintMenuCard("3", "Dining philosophers", "Pick up and put down forks by hand");
-                UI::PrintMenuCard("4", "Unsafe demos", "See what breaks without synchronization");
-                UI::PrintMenuCard("5", "Session report", "What you did this session");
-                UI::PrintMenuCard("6", "Settings", "Buffer size, wait time, philosophers");
-                UI::PrintMenuCard("7", "Export CSV", "Save the session report to a file");
-                UI::PrintMenuCard("8", "Colors", std::string("currently ") + (Color::enable_colors ? "on" : "off"));
-                UI::PrintMenuCard("0", "Quit", "");
-
-                std::cout << "  " << std::string(79, '-') << "\n\n";
+                UI::PrintMenuCard("1", "Producer-consumer", "Shared buffer");
+                UI::PrintMenuCard("2", "Readers-writers", "Shared database");
+                UI::PrintMenuCard("3", "Dining philosophers", "Fork allocation");
+                UI::PrintMenuCard("4", "Unsafe demos", "Behavior without synchronization");
+                UI::PrintMenuCard("5", "Report", "Session summary and CSV export");
+                UI::PrintMenuCard("6", "Settings", "");
+                UI::PrintMenuCard("0", "Exit", "");
+                std::cout << "\n";
                 UI::animate_menu = false;
 
-                int choice = UI::SafeReadInt("  Choose (0-8): ", 0, 8);
+                int choice = UI::SafeReadInt("  Select: ", 0, 6);
 
                 switch (choice) {
-                    case 1:
-                        runScreen([&] { ProducerConsumerEngine::runInteractiveMode(config_mgr.getConfig()); });
-                        break;
-                    case 2:
-                        runScreen([&] { ReadersWritersEngine::runInteractiveMode(config_mgr.getConfig()); });
-                        break;
-                    case 3:
-                        runScreen([&] { DiningPhilosophersEngine::runInteractiveMode(config_mgr.getConfig()); });
-                        break;
-                    case 4:
-                        runScreen([&] {
-                            UI::ClearScreen();
-                            UI::PrintHeader("UNSAFE DEMOS");
-                            UI::PrintBreadcrumb("Main menu > Unsafe demos");
-                            std::cout << "  These run locally in this terminal only.\n\n"
-                                      << "  1. Producer-consumer (overflow and underflow)\n"
-                                      << "  2. Readers-writers (dirty read)\n"
-                                      << "  3. Dining philosophers (circular wait deadlock)\n\n";
-                            int naive_choice = UI::SafeReadInt("  Choose (1-3): ", 1, 3);
-                            if (naive_choice == 1) ProducerConsumerEngine::runNaiveInteractiveMode(config_mgr.getConfig());
-                            else if (naive_choice == 2) ReadersWritersEngine::runNaiveInteractiveMode();
-                            else DiningPhilosophersEngine::runNaiveInteractiveDeadlockDemo(config_mgr.getConfig());
-                        });
-                        break;
-                    case 5:
-                        runScreen([&] { UI::ClearScreen(); g_Analyzer.displaySummaryTable(); });
-                        break;
-                    case 6:
-                        runScreen([&] { UI::ClearScreen(); config_mgr.configureAll(); });
-                        break;
-                    case 7:
-                        runScreen([&] { UI::ClearScreen(); g_Analyzer.exportCSVReport(); });
-                        break;
-                    case 8:
-                        Color::enable_colors = !Color::enable_colors;
-                        std::cout << "\n";
-                        UI::LoadingDots("Switching colors");
-                        std::cout << Color::Green() << "  Colors are now " << (Color::enable_colors ? "on" : "off") << ".\n" << Color::Reset();
-                        UI::Pause();
-                        break;
-                    case 0:
-                        running = false;
-                        break;
+                    case 1: runScreen([&] { ProducerConsumerEngine::runInteractiveMode(config); }); break;
+                    case 2: runScreen([&] { ReadersWritersEngine::runInteractiveMode(config); }); break;
+                    case 3: runScreen([&] { DiningPhilosophersEngine::runInteractiveMode(config); }); break;
+                    case 4: runScreen([&] { unsafeDemos(); }); break;
+                    case 5: runScreen([&] { report(); }); break;
+                    case 6: runScreen([&] { settings(); }); break;
+                    default: running = false; break;
                 }
             }
         }
@@ -2237,13 +2149,14 @@ namespace Toolkit {
 int main() {
     using namespace Toolkit;
     UI::InitTerminal();
+    g_Logger.setEcho(false);   // screens redraw; messages go to the log file
 
     int exit_code = 0;
     try {
         MainMenu menu;
         menu.run();
     } catch (const UI::InputClosed&) {
-        std::cout << "\n  Input closed, shutting down.\n";
+        std::cout << "\n  Input closed.\n";
     } catch (const std::exception& e) {
         UI::PrintErrorCard(std::string("Unexpected error: ") + e.what());
         exit_code = 1;
@@ -2252,13 +2165,13 @@ int main() {
         exit_code = 1;
     }
 
-    // Give back anything we still hold so the other terminals aren't stuck.
+    // Release anything still held so other terminals are not blocked.
     std::cout << "\n";
-    UI::LoadingDots("Releasing locks and shutting down");
+    UI::LoadingDots("Disconnecting");
     g_Session.detach();
 
     std::cout << Color::Cyan() << "  ";
-    UI::TypeText("Bye!", 25);
+    UI::TypeText("Session ended.", 20);
     std::cout << "\n" << Color::Reset();
     return exit_code;
 }
