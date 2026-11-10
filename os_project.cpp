@@ -1,17 +1,3 @@
-// ThreadWeaver - OS lab project
-//
-// Hands-on versions of the classic synchronization problems: producer-consumer,
-// readers-writers and dining philosophers. You drive every step yourself from
-// the menu.
-//
-// Producer-consumer and readers-writers are shared between processes. Open the
-// program in two (or more) terminals and they all work on the same buffer and
-// the same database at the same time. The state lives in a named shared memory
-// block, and access is controlled with named OS semaphores and mutexes, so the
-// textbook algorithms really run across separate processes.
-//
-// Build:  g++ -std=c++17 -pthread os_project.cpp -o os_project
-//         (on older Linux systems you may also need -lrt)
 
 #include <iostream>
 #include <vector>
@@ -54,11 +40,6 @@
 #include <unistd.h>
 #endif
 
-// ---------------------------------------------------------------------------
-// Thin wrappers around the OS primitives we need for sharing between processes.
-// Windows uses named kernel objects; everything else uses POSIX named
-// semaphores and shm_open.
-// ---------------------------------------------------------------------------
 namespace ipc {
 
     enum class WaitResult { Acquired, Abandoned, TimedOut, Failed };
@@ -67,8 +48,6 @@ namespace ipc {
 
     inline int32_t currentPid() { return static_cast<int32_t>(GetCurrentProcessId()); }
 
-    // Creation time of a process. We store it next to the pid so that a pid
-    // recycled by Windows isn't mistaken for a terminal that's still open.
     inline int64_t processStamp(int32_t pid) {
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
         if (!h) return 0;
@@ -85,7 +64,6 @@ namespace ipc {
         if (pid <= 0) return false;
         HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
         if (!h) {
-            // Access denied means the process exists, we just can't look at it.
             return GetLastError() == ERROR_ACCESS_DENIED;
         }
         bool running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
@@ -123,7 +101,6 @@ namespace ipc {
         bool post(long n = 1) { return handle_ && ReleaseSemaphore(handle_, n, nullptr) != FALSE; }
         void close() { if (handle_) { CloseHandle(handle_); handle_ = nullptr; } }
 
-        // Windows deletes named objects when the last handle closes.
         static void remove(const std::string&) {}
 
     private:
@@ -147,7 +124,7 @@ namespace ipc {
             if (!handle_) return WaitResult::Failed;
             DWORD r = WaitForSingleObject(handle_, timeout_ms < 0 ? INFINITE : static_cast<DWORD>(timeout_ms));
             if (r == WAIT_OBJECT_0) return WaitResult::Acquired;
-            if (r == WAIT_ABANDONED) return WaitResult::Abandoned;  // previous owner died holding it
+            if (r == WAIT_ABANDONED) return WaitResult::Abandoned;
             if (r == WAIT_TIMEOUT) return WaitResult::TimedOut;
             return WaitResult::Failed;
         }
@@ -211,14 +188,13 @@ namespace ipc {
         Semaphore& operator=(const Semaphore&) = delete;
         ~Semaphore() { close(); }
 
-        bool open(const std::string& base, long initial, long /*max_count*/) {
+        bool open(const std::string& base, long initial, long ) {
             close();
             sem_ = sem_open(objectName(base).c_str(), O_CREAT, 0600, static_cast<unsigned>(initial));
             if (sem_ == SEM_FAILED) { sem_ = nullptr; return false; }
             return true;
         }
 
-        // sem_timedwait doesn't exist on macOS, so poll with a short sleep instead.
         WaitResult wait(int timeout_ms) {
             if (!sem_) return WaitResult::Failed;
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -245,8 +221,6 @@ namespace ipc {
         sem_t* sem_ = nullptr;
     };
 
-    // POSIX has no named mutex, so use a binary semaphore. It can't tell us
-    // when its owner dies; the session code covers that with owner pids.
     class Mutex {
     public:
         bool open(const std::string& base) { return sem_.open(base, 1, 1); }
@@ -351,9 +325,9 @@ namespace Toolkit {
     private:
         std::mutex log_mutex;
         std::ofstream log_file;
-        ipc::Mutex file_lock;   // several terminals append to the same file
+        ipc::Mutex file_lock;
         bool file_lock_ok = false;
-        bool echo = true;       // also print to the console
+        bool echo = true;
         std::string source = "--";
 
     public:
@@ -367,8 +341,6 @@ namespace Toolkit {
             source = name;
         }
 
-        // Screens redraw themselves, so console output would just flicker past.
-        // With echo off, messages only go to the log file.
         void setEcho(bool on) {
             std::lock_guard<std::mutex> lock(log_mutex);
             echo = on;
@@ -402,8 +374,6 @@ namespace Toolkit {
             }
 
             if (log_file.is_open()) {
-                // If another terminal hangs on to the log lock we write anyway
-                // rather than freeze the UI.
                 bool locked = false;
                 if (file_lock_ok) {
                     ipc::WaitResult r = file_lock.wait(300);
@@ -420,8 +390,6 @@ namespace Toolkit {
 
     namespace UI {
 
-        // Thrown when stdin is closed (Ctrl+Z / Ctrl+D or a closed pipe) so we
-        // can shut down cleanly instead of spinning on a dead stream.
         struct InputClosed : std::runtime_error {
             InputClosed() : std::runtime_error("input stream was closed") {}
         };
@@ -529,7 +497,6 @@ namespace Toolkit {
             std::cout << "  " << Color::Cyan() << "[" << num << "]" << Color::Reset() << " " << text << "\n";
         }
 
-        // One-line result of the last action, shown under the screen's status.
         struct Status {
             enum class Kind { None, Ok, Info, Warn, Error };
             Kind kind = Kind::None;
@@ -571,11 +538,6 @@ namespace Toolkit {
             std::cout << "\r" << std::string(task_label.length() + 20, ' ') << "\r" << std::flush;
         }
 
-        // Runs `work` on a worker thread and keeps a spinner with a countdown
-        // going on this thread until it finishes. Used for the semaphore waits,
-        // which can block for a while when another terminal holds the resource.
-        // `on_tick` runs about every 400 ms on this thread so the caller can
-        // redraw the screen when another terminal changes something.
         template <typename Work, typename Tick>
         auto RunWithSpinner(const std::string& label, int timeout_ms, Work&& work, Tick&& on_tick) -> decltype(work()) {
             auto task = std::async(std::launch::async, std::forward<Work>(work));
@@ -585,7 +547,7 @@ namespace Toolkit {
 
             for (int frame = 0;; ++frame) {
                 bool done = task.wait_for(std::chrono::milliseconds(80)) == std::future_status::ready;
-                if (done && frame >= 4) break;  // show a few frames even when it's instant
+                if (done && frame >= 4) break;
                 if (done) std::this_thread::sleep_for(std::chrono::milliseconds(80));
                 if (!done && frame % 5 == 0) on_tick();
 
@@ -635,8 +597,6 @@ namespace Toolkit {
             return line;
         }
 
-        // Returns true and sets `out` if `line` is a whole number in range;
-        // otherwise prints why it was rejected. Blank lines are rejected silently.
         inline bool ParseChoice(const std::string& line, int min_val, int max_val, int& out) {
             if (line.find_first_not_of(" \t") == std::string::npos) return false;
 
@@ -662,11 +622,6 @@ namespace Toolkit {
             }
         }
 
-        // Like SafeReadInt, but while nothing is being typed it calls
-        // `refresh` twice a second. If refresh redraws the screen (returns
-        // true) the prompt and anything typed so far are printed again. This
-        // keeps shared screens live while the user is deciding what to do.
-        // Needs a real console; with redirected input it falls back to SafeReadInt.
         template <typename Refresh>
         inline int ReadChoiceLive(const std::string& prompt, int min_val, int max_val, Refresh&& refresh) {
 #ifdef _WIN32
@@ -679,8 +634,8 @@ namespace Toolkit {
                 for (;;) {
                     if (_kbhit()) {
                         int c = _getch();
-                        if (c == 0 || c == 0xE0) { _getch(); continue; }        // arrow/function keys
-                        if (c == 3 || (c == 26 && typed.empty())) throw InputClosed();  // Ctrl+C / Ctrl+Z
+                        if (c == 0 || c == 0xE0) { _getch(); continue; }
+                        if (c == 3 || (c == 26 && typed.empty())) throw InputClosed();
                         if (c == '\r' || c == '\n') {
                             std::cout << "\n";
                             int val = 0;
@@ -715,34 +670,24 @@ namespace Toolkit {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The shared session: one block of shared memory that every open terminal maps,
-// plus the semaphores and mutexes that guard it.
-//
-// Lock order (always the same, which is what keeps this deadlock free):
-//     read-count lock  ->  db write semaphore  ->  state lock
-//     empty/full semaphore  ->  state lock
-// The state lock is only ever held for a few lines and never while waiting on
-// anything else or waiting for the user to type.
-// ---------------------------------------------------------------------------
 namespace Toolkit {
 
     constexpr int kMaxTerminals = 8;
     constexpr int kMaxBufferSize = 100;
     constexpr int kActivitySize = 8;
-    constexpr uint32_t kMagic = 0x54575331;   // "TWS1"
+    constexpr uint32_t kMagic = 0x54575331;
     constexpr int kStateLockMs = 3000;
     constexpr int kReleaseLockMs = 10000;
 
     enum WaitingFor : int32_t { kNotWaiting = 0, kWaitProduce, kWaitConsume, kWaitRead, kWaitWrite };
 
     struct TerminalSlot {
-        int32_t pid;        // 0 means the slot is free
-        int32_t number;     // what we show to people: terminal 1, 2, ...
+        int32_t pid;
+        int32_t number;
         int64_t stamp;
         int32_t reading;
         int32_t writing;
-        int32_t waiting;    // one of WaitingFor
+        int32_t waiting;
     };
 
     struct ActivityLine {
@@ -754,34 +699,31 @@ namespace Toolkit {
     struct SharedData {
         TerminalSlot terminals[kMaxTerminals];
 
-        // producer-consumer
         int32_t capacity;
         int32_t items[kMaxBufferSize];
-        int32_t item_from[kMaxBufferSize];   // terminal that produced each item
+        int32_t item_from[kMaxBufferSize];
         int32_t front;
         int32_t rear;
         int32_t count;
         uint64_t produced;
         uint64_t consumed;
 
-        // readers-writers
         int32_t db_value;
-        int32_t read_count;       // guarded by the read-count lock, not the state lock
-        int32_t writer_terminal;  // 0 when nobody is writing
+        int32_t read_count;
+        int32_t writer_terminal;
         uint64_t reads;
         uint64_t writes;
 
-        // last few things that happened, from every terminal
         uint32_t activity_next;
-        uint32_t change_seq;      // bumped on every change so screens know when to redraw
+        uint32_t change_seq;
         ActivityLine activity[kActivitySize];
     };
 
     struct SharedBlock {
         uint32_t magic;
         uint32_t layout_size;
-        std::atomic<int32_t> state_owner;   // pid holding the state lock
-        std::atomic<int32_t> rc_owner;      // pid holding the read-count lock
+        std::atomic<int32_t> state_owner;
+        std::atomic<int32_t> rc_owner;
         SharedData data;
     };
 
@@ -799,8 +741,6 @@ namespace Toolkit {
         static OpResult Failed(std::string m) { return {Status::Failed, 0, std::move(m)}; }
     };
 
-    // Scoped hold on a cross-process lock. Records the owner's pid so that if a
-    // terminal dies while holding it, the others can tell and take over.
     class CrossLock {
     public:
         CrossLock(ipc::Mutex& m, std::atomic<int32_t>& owner, int timeout_ms) : mutex_(m), owner_(owner) {
@@ -813,10 +753,6 @@ namespace Toolkit {
                 return;
             }
 #ifndef _WIN32
-            // POSIX semaphores don't notice a dead owner. If the recorded owner
-            // is gone, inherit its hold (the semaphore count is still 0, so our
-            // release later puts it back to 1). The CAS stops two terminals from
-            // both doing this.
             if (r == ipc::WaitResult::TimedOut) {
                 int32_t holder = owner_.load();
                 if (holder != 0 && holder != me && !ipc::isAlive(holder, 0) &&
@@ -872,8 +808,6 @@ namespace Toolkit {
 
             if (!openBlock(error, true)) return false;
 
-            // Every failure below leaves the locked scope before closeAll(), so
-            // the lock is released while the shared memory is still mapped.
             bool ok = false;
             {
                 CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
@@ -889,7 +823,7 @@ namespace Toolkit {
             }
             if (!ok) { closeAll(); return false; }
 
-            reapDeadTerminals();   // free any slots left behind by crashed terminals
+            reapDeadTerminals();
 
             ok = false;
             {
@@ -907,7 +841,6 @@ namespace Toolkit {
                 }
 
                 if (my_index_ >= 0) {
-                    // Lowest number nobody else is using, so people see 1, 2, 3...
                     number_ = 1;
                     for (bool taken = true; taken; ) {
                         taken = false;
@@ -948,7 +881,6 @@ namespace Toolkit {
             }
             closeAll();
 #ifndef _WIN32
-            // POSIX objects stick around after everyone exits; tidy up.
             if (last) removeNames();
 #else
             (void)last;
@@ -960,8 +892,6 @@ namespace Toolkit {
         bool isReading() const { return reading_; }
         bool isWriting() const { return writing_; }
 
-        // Drops any read or write hold this terminal still has. Safe to call
-        // any time; used on the way out and after unexpected errors.
         void releaseHeld() {
             if (writing_) endWrite(false, 0);
             if (reading_) endRead();
@@ -1010,19 +940,16 @@ namespace Toolkit {
             return s;
         }
 
-        // ---- producer-consumer --------------------------------------------
-
         OpResult produce(int value, int timeout_ms) {
             if (!block_) return OpResult::Failed("Not connected to the shared session.");
             if (!setWaiting(kWaitProduce)) return busyResult();
 
-            // Classic order: wait(empty) -> lock -> add item -> unlock -> signal(full)
             ipc::WaitResult r = empty_.wait(timeout_ms);
             OpResult result;
             {
                 CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
                 if (!lock.held()) {
-                    if (r == ipc::WaitResult::Acquired) empty_.post();   // don't lose the slot
+                    if (r == ipc::WaitResult::Acquired) empty_.post();
                     return busyResult();
                 }
                 SharedData& d = block_->data;
@@ -1034,8 +961,6 @@ namespace Toolkit {
                     return OpResult::Failed("Could not wait on the empty-slot semaphore.");
 
                 if (d.count >= d.capacity) {
-                    // The semaphore let us in but the buffer is full. That should
-                    // never happen; keep the data safe and don't pass the bad token on.
                     logActivityLocked("buffer inconsistency detected on produce");
                     return OpResult::Failed("Buffer state is inconsistent. The item was not added.");
                 }
@@ -1056,7 +981,6 @@ namespace Toolkit {
             if (!block_) return OpResult::Failed("Not connected to the shared session.");
             if (!setWaiting(kWaitConsume)) return busyResult();
 
-            // Classic order: wait(full) -> lock -> take item -> unlock -> signal(empty)
             ipc::WaitResult r = full_.wait(timeout_ms);
             OpResult result;
             {
@@ -1091,8 +1015,6 @@ namespace Toolkit {
             return result;
         }
 
-        // Only allowed while the buffer is empty and nobody is waiting on it,
-        // because the empty-slot semaphore has to be topped up or drained to match.
         OpResult resizeBuffer(int new_capacity) {
             if (!block_) return OpResult::Failed("Not connected to the shared session.");
             new_capacity = std::max(1, std::min(kMaxBufferSize, new_capacity));
@@ -1128,8 +1050,6 @@ namespace Toolkit {
             return OpResult::Ok(new_capacity, "Buffer size set to " + std::to_string(new_capacity) + ".");
         }
 
-        // ---- readers-writers (readers get priority) ------------------------
-
         OpResult beginRead(int timeout_ms) {
             if (!block_) return OpResult::Failed("Not connected to the shared session.");
             if (reading_ || writing_) return OpResult::Failed("This terminal already holds a database lock.");
@@ -1147,7 +1067,6 @@ namespace Toolkit {
                 }
                 recovered = rc.recovered();
 
-                // First reader in locks writers out for the whole group.
                 bool first = d.read_count <= 0;
                 if (first) {
                     d.read_count = 0;
@@ -1163,7 +1082,6 @@ namespace Toolkit {
 
                 CrossLock state(state_lock_, block_->state_owner, kStateLockMs);
                 if (!state.held()) {
-                    // Undo, otherwise writers would be shut out for good.
                     d.read_count--;
                     if (first) wrt_.post();
                     return busyResult();
@@ -1188,7 +1106,7 @@ namespace Toolkit {
 
                 if (d.read_count > 0) {
                     d.read_count--;
-                    if (d.read_count == 0) wrt_.post();   // last reader out lets writers in
+                    if (d.read_count == 0) wrt_.post();
                 }
 
                 CrossLock state(state_lock_, block_->state_owner, kStateLockMs);
@@ -1245,7 +1163,6 @@ namespace Toolkit {
                     result = OpResult::Failed("Could not save the value. Shared state is locked.");
                 }
             }
-            // Always give the database back, even if saving failed.
             wrt_.post();
             writing_ = false;
             return result;
@@ -1276,8 +1193,6 @@ namespace Toolkit {
             block_ = static_cast<SharedBlock*>(memory_.data());
 
 #ifndef _WIN32
-            // POSIX objects outlive the processes that made them. If nobody in
-            // the table is alive any more, it's left over from a crashed run.
             if (!created && allow_reset && block_->magic == kMagic) {
                 bool anyone = false;
                 for (const auto& t : block_->data.terminals) {
@@ -1304,8 +1219,6 @@ namespace Toolkit {
             block_->magic = kMagic;
         }
 
-        // Initial values only matter when the semaphore is being created. If
-        // another terminal already made it, the OS keeps the current count.
         bool openSemaphoresLocked() {
             const SharedData& d = block_->data;
             bool db_free = d.read_count <= 0 && d.writer_terminal == 0;
@@ -1335,7 +1248,6 @@ namespace Toolkit {
             ipc::Semaphore::remove("db.write");
         }
 
-        // Caller must hold the state lock.
         void logActivityLocked(const std::string& text) {
             SharedData& d = block_->data;
             ActivityLine& line = d.activity[d.activity_next % kActivitySize];
@@ -1356,8 +1268,6 @@ namespace Toolkit {
 
         void clearWaiting() { setWaiting(kNotWaiting); }
 
-        // Background thread: once a second, look for terminals that were
-        // closed or crashed and give back whatever they were holding.
         void reaperLoop() {
             std::unique_lock<std::mutex> lk(reaper_mutex_);
             while (!stop_reaper_) {
@@ -1367,7 +1277,6 @@ namespace Toolkit {
                 try {
                     reapDeadTerminals();
                 } catch (...) {
-                    // Never let the cleanup thread take the program down.
                 }
                 lk.lock();
             }
@@ -1391,7 +1300,7 @@ namespace Toolkit {
             std::vector<Orphan> orphans;
             {
                 CrossLock lock(state_lock_, block_->state_owner, 500);
-                if (!lock.held()) return;   // try again next tick
+                if (!lock.held()) return;
                 for (auto& t : d.terminals) {
                     if (t.pid == 0 || t.pid == pid_ || ipc::isAlive(t.pid, t.stamp)) continue;
                     orphans.push_back({t.reading != 0, t.writing != 0});
@@ -1406,11 +1315,9 @@ namespace Toolkit {
                 if (o.reading) pending_reader_releases_++;
             }
 
-            // A dead reader still counts towards read_count; take it off so the
-            // last real reader (or nobody) lets writers back in.
             while (pending_reader_releases_ > 0) {
                 CrossLock rc(rc_lock_, block_->rc_owner, 500);
-                if (!rc.held()) break;   // retry on the next tick
+                if (!rc.held()) break;
                 if (d.read_count > 0) {
                     d.read_count--;
                     if (d.read_count == 0) wrt_.post();
@@ -1451,7 +1358,7 @@ namespace Toolkit {
     struct ProblemConfig {
         int buffer_capacity = 5;
         int num_philosophers = 5;
-        int wait_seconds = 20;   // how long a blocked action waits before giving up
+        int wait_seconds = 20;
     };
 
     struct BenchmarkResult {
@@ -1470,7 +1377,6 @@ namespace Toolkit {
         std::vector<BenchmarkResult> history;
         std::mutex history_mutex;
 
-        // Quote a CSV field and double any quotes inside it.
         static std::string csvField(const std::string& s) {
             std::string out = "\"";
             for (char c : s) {
@@ -1554,7 +1460,6 @@ namespace Toolkit {
 
 namespace Toolkit {
 
-    // Local buffer, used only by the unsynchronized demo.
     template <typename T>
     class CircularBuffer {
     private:
@@ -1593,7 +1498,6 @@ namespace Toolkit {
 
     namespace View {
 
-        // Draws buffer slots, ten per row: [  42] for an item, [    ] for empty.
         template <typename Filled, typename ValueAt>
         inline void PrintSlots(int capacity, Filled filled, ValueAt value_at) {
             for (int i = 0; i < capacity; ++i) {
@@ -1642,7 +1546,6 @@ namespace Toolkit {
             return std::to_string(n) + " " + word + (n == 1 ? "" : "s");
         }
 
-        // Header, connection line and a hint when this is the only terminal.
         inline void PrintSharedTop(const std::string& title, bool first, const SharedSession::Snapshot& snap) {
             UI::ClearScreen();
             UI::PrintHeader(title, first);
@@ -1655,8 +1558,6 @@ namespace Toolkit {
             std::cout << "\n";
         }
 
-        // Spinner tick callback: redraws with `draw` whenever the shared state
-        // has changed since it was last shown.
         template <typename Draw>
         inline auto LiveRedraw(uint32_t shown_version, Draw draw) {
             return [shown_version, draw]() mutable {
@@ -1667,8 +1568,6 @@ namespace Toolkit {
             };
         }
 
-        // Same idea for the idle prompt: returns true when it redrew, so the
-        // prompt can be printed again underneath.
         template <typename Draw>
         inline auto IdleRedraw(uint32_t shown_version, Draw draw) {
             return [shown_version, draw]() mutable {
@@ -1703,8 +1602,6 @@ namespace Toolkit {
             Timer timer;
             timer.start();
 
-            // Draws the whole screen. Also used while waiting, so changes made
-            // in other terminals show up live during the countdown.
             auto draw = [&](const SharedSession::Snapshot& snap, bool animate, const UI::Status& st, bool waiting) {
                 View::PrintSharedTop("PRODUCER-CONSUMER", animate, snap);
                 if (snap.ok) {
@@ -1831,8 +1728,6 @@ namespace Toolkit {
             Timer timer;
             timer.start();
 
-            // Draws the whole screen. Also used while waiting, so changes made
-            // in other terminals show up live during the countdown.
             auto draw = [&](const SharedSession::Snapshot& snap, bool animate, const UI::Status& st, bool waiting) {
                 View::PrintSharedTop("READERS-WRITERS", animate, snap);
                 if (snap.ok) {
@@ -1968,15 +1863,17 @@ namespace Toolkit {
 
     class DiningPhilosophersEngine {
     private:
-        static void printTable(int n, const std::vector<bool>& fork_taken, const std::vector<std::string>& state) {
+        static void printTable(int n, const std::vector<int>& fork_owner, const std::vector<std::string>& state) {
             std::cout << Color::Bold() << "  " << std::left << std::setw(14) << "Philosopher" << std::setw(12) << "State"
-                      << std::setw(14) << "Left fork" << "Right fork" << Color::Reset() << "\n";
+                      << std::setw(16) << "Left fork" << "Right fork" << Color::Reset() << "\n";
             for (int i = 0; i < n; ++i) {
                 int l = i, r = (i + 1) % n;
                 auto fork = [&](int f) {
-                    std::string text = std::to_string(f) + (fork_taken[f] ? " in use" : " free");
-                    return (fork_taken[f] ? Color::Red() : Color::Green()) + text + Color::Reset() +
-                           std::string(std::max<int>(1, 14 - static_cast<int>(text.size())), ' ');
+                    int owner = fork_owner[f];
+                    std::string text = std::to_string(f) + (owner < 0 ? " free" : owner == i ? " held" : " in use");
+                    std::string color = owner < 0 ? Color::Green() : owner == i ? Color::Cyan() : Color::Red();
+                    return color + text + Color::Reset() +
+                           std::string(std::max<int>(1, 16 - static_cast<int>(text.size())), ' ');
                 };
                 std::string st_color = state.empty() ? Color::Reset() : (state[i] == "Eating" ? Color::Green() : Color::Yellow());
                 std::cout << "  " << std::setw(14) << i
@@ -1988,7 +1885,7 @@ namespace Toolkit {
     public:
         static void runInteractiveMode(const ProblemConfig& config) {
             int N = config.num_philosophers;
-            std::vector<bool> fork_taken(N, false);
+            std::vector<int> fork_owner(N, -1);
             std::vector<std::string> phil_state(N, "Thinking");
             uint64_t meals = 0, blocked = 0;
             UI::Status status = UI::Status::Info("Pick up the left fork, then the right fork to start eating.");
@@ -2001,7 +1898,7 @@ namespace Toolkit {
                 UI::PrintHeader("DINING PHILOSOPHERS", first);
                 first = false;
 
-                printTable(N, fork_taken, phil_state);
+                printTable(N, fork_owner, phil_state);
                 std::cout << "\n";
                 UI::PrintStatus(status);
                 View::PrintActions({{"1", "Take left fork"}, {"2", "Take right fork"}, {"3", "Release forks"}, {"0", "Back"}});
@@ -2015,32 +1912,39 @@ namespace Toolkit {
 
                 if (option == 1) {
                     UI::SpinnerAnimation("Taking fork " + std::to_string(left));
-                    if (!fork_taken[left]) {
-                        fork_taken[left] = true;
-                        status = UI::Status::Ok(name + " took fork " + std::to_string(left) + ".");
-                    } else {
+                    if (fork_owner[left] == p) {
+                        status = UI::Status::Info(name + " already holds fork " + std::to_string(left) + ".");
+                    } else if (fork_owner[left] >= 0) {
                         blocked++;
                         status = UI::Status::Error("Fork " + std::to_string(left) + " is in use.");
+                    } else {
+                        fork_owner[left] = p;
+                        status = UI::Status::Ok(name + " took fork " + std::to_string(left) + ".");
                     }
                 } else if (option == 2) {
                     UI::SpinnerAnimation("Taking fork " + std::to_string(right));
-                    if (!fork_taken[left]) {
+                    if (phil_state[p] == "Eating") {
+                        status = UI::Status::Info(name + " is already eating.");
+                    } else if (fork_owner[left] != p) {
                         blocked++;
                         status = UI::Status::Warn(name + " must take the left fork (" + std::to_string(left) + ") first.");
-                    } else if (fork_taken[right]) {
+                    } else if (fork_owner[right] >= 0) {
                         blocked++;
                         status = UI::Status::Error("Fork " + std::to_string(right) + " is in use.");
                     } else {
-                        fork_taken[right] = true;
+                        fork_owner[right] = p;
                         phil_state[p] = "Eating";
                         meals++;
                         status = UI::Status::Ok(name + " is eating.");
                     }
                 } else if (option == 3) {
-                    fork_taken[left] = false;
-                    fork_taken[right] = false;
+                    bool held = false;
+                    for (int f : {left, right}) {
+                        if (fork_owner[f] == p) { fork_owner[f] = -1; held = true; }
+                    }
                     phil_state[p] = "Thinking";
-                    status = UI::Status::Ok(name + " released both forks.");
+                    status = held ? UI::Status::Ok(name + " released its forks.")
+                                  : UI::Status::Info(name + " is not holding any forks.");
                 }
             }
 
@@ -2052,7 +1956,7 @@ namespace Toolkit {
 
         static void runNaiveInteractiveDeadlockDemo(const ProblemConfig& config) {
             int N = config.num_philosophers;
-            std::vector<bool> fork_taken(N, false);
+            std::vector<int> fork_owner(N, -1);
             int held = 0;
             UI::Status status = UI::Status::Info("Each philosopher takes only the left fork. When all do, no one can eat.");
             bool first = true;
@@ -2064,7 +1968,7 @@ namespace Toolkit {
                 UI::PrintHeader("DINING PHILOSOPHERS (DEADLOCK)", first);
                 first = false;
 
-                printTable(N, fork_taken, {});
+                printTable(N, fork_owner, {});
                 std::cout << "\n";
                 View::PrintLabel("Forks held", std::to_string(held) + " of " + std::to_string(N));
                 std::cout << "\n";
@@ -2075,17 +1979,17 @@ namespace Toolkit {
 
                 if (option == 1) {
                     int p = UI::SafeReadInt("  Philosopher (0-" + std::to_string(N - 1) + "): ", 0, N - 1);
-                    if (fork_taken[p]) {
+                    if (fork_owner[p] >= 0) {
                         status = UI::Status::Warn("Fork " + std::to_string(p) + " is already held.");
                     } else {
-                        fork_taken[p] = true;
+                        fork_owner[p] = p;
                         held++;
                         status = UI::Status::Warn("Philosopher " + std::to_string(p) + " holds fork " + std::to_string(p) +
                                                   " and waits for fork " + std::to_string((p + 1) % N) + ".");
                     }
                 } else if (option == 2) {
                     UI::SpinnerAnimation("All philosophers taking their left fork");
-                    std::fill(fork_taken.begin(), fork_taken.end(), true);
+                    for (int i = 0; i < N; ++i) fork_owner[i] = i;
                     held = N;
                 } else {
                     running = false;
@@ -2114,8 +2018,6 @@ namespace Toolkit {
     private:
         ProblemConfig config;
 
-        // Runs one screen. An unexpected error returns to the menu instead of
-        // ending the program while a shared lock is held.
         template <typename Screen>
         void runScreen(Screen&& screen) {
             try {
@@ -2169,6 +2071,11 @@ namespace Toolkit {
                 UI::PrintHeader("SETTINGS", first);
                 first = false;
 
+                if (g_Session.isAttached()) {
+                    auto snap = g_Session.snapshot();
+                    if (snap.ok) config.buffer_capacity = snap.capacity;
+                }
+
                 UI::PrintMenuCard("1", "Buffer size", std::to_string(config.buffer_capacity) + " slots");
                 UI::PrintMenuCard("2", "Wait timeout", std::to_string(config.wait_seconds) + " seconds");
                 UI::PrintMenuCard("3", "Philosophers", std::to_string(config.num_philosophers));
@@ -2220,7 +2127,6 @@ namespace Toolkit {
 
             if (g_Session.attach(config.buffer_capacity, g_SessionError)) {
                 g_Logger.setSource("T" + std::to_string(g_Session.terminalNumber()));
-                // Another terminal may have created the buffer with a different size.
                 auto snap = g_Session.snapshot();
                 if (snap.ok) config.buffer_capacity = snap.capacity;
             } else {
@@ -2264,7 +2170,7 @@ namespace Toolkit {
 int main() {
     using namespace Toolkit;
     UI::InitTerminal();
-    g_Logger.setEcho(false);   // screens redraw; messages go to the log file
+    g_Logger.setEcho(false);
 
     int exit_code = 0;
     try {
@@ -2280,7 +2186,6 @@ int main() {
         exit_code = 1;
     }
 
-    // Release anything still held so other terminals are not blocked.
     std::cout << "\n";
     UI::LoadingDots("Disconnecting");
     g_Session.detach();
