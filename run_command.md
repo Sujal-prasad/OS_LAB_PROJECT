@@ -1,1 +1,13 @@
-Stop-Process -Name "os_project" -Force -ErrorAction SilentlyContinue; cd C:\Users\Simpu\Desktop\OS_LAB_PROJECT; chcp 65001; g++ -std=c++17 -pthread os_project.cpp -o os_project.exe; .\os_project.exe
+# Run
+
+### Terminal 1
+
+```
+cd C:\Users\Simpu\Desktop\OS_LAB_PROJECT; g++ -std=c++17 -pthread os_project.cpp -o os_project.exe; .\os_project.exe
+```
+
+### Terminal 2 (and more)
+
+```
+cd C:\Users\Simpu\Desktop\OS_LAB_PROJECT; .\os_project.exe
+```
