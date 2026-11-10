@@ -40,6 +40,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <conio.h>
 #ifdef ERROR
 #undef ERROR
 #endif
@@ -573,8 +574,10 @@ namespace Toolkit {
         // Runs `work` on a worker thread and keeps a spinner with a countdown
         // going on this thread until it finishes. Used for the semaphore waits,
         // which can block for a while when another terminal holds the resource.
-        template <typename Work>
-        auto RunWithSpinner(const std::string& label, int timeout_ms, Work&& work) -> decltype(work()) {
+        // `on_tick` runs about every 400 ms on this thread so the caller can
+        // redraw the screen when another terminal changes something.
+        template <typename Work, typename Tick>
+        auto RunWithSpinner(const std::string& label, int timeout_ms, Work&& work, Tick&& on_tick) -> decltype(work()) {
             auto task = std::async(std::launch::async, std::forward<Work>(work));
             const char frames[] = {'|', '/', '-', '\\'};
             auto started = std::chrono::steady_clock::now();
@@ -584,6 +587,7 @@ namespace Toolkit {
                 bool done = task.wait_for(std::chrono::milliseconds(80)) == std::future_status::ready;
                 if (done && frame >= 4) break;  // show a few frames even when it's instant
                 if (done) std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                if (!done && frame % 5 == 0) on_tick();
 
                 auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
                 long long left = std::max<long long>(0, (timeout_ms - waited + 999) / 1000);
@@ -593,6 +597,11 @@ namespace Toolkit {
             }
             std::cout << "\r" << std::string(line.length() + 10, ' ') << "\r" << std::flush;
             return task.get();
+        }
+
+        template <typename Work>
+        auto RunWithSpinner(const std::string& label, int timeout_ms, Work&& work) -> decltype(work()) {
+            return RunWithSpinner(label, timeout_ms, std::forward<Work>(work), [] {});
         }
 
         inline void ProgressBarAnimation(const std::string& label, int duration_ms = 500) {
@@ -626,24 +635,78 @@ namespace Toolkit {
             return line;
         }
 
+        // Returns true and sets `out` if `line` is a whole number in range;
+        // otherwise prints why it was rejected. Blank lines are rejected silently.
+        inline bool ParseChoice(const std::string& line, int min_val, int max_val, int& out) {
+            if (line.find_first_not_of(" \t") == std::string::npos) return false;
+
+            std::istringstream in(line);
+            long long val = 0;
+            char extra = 0;
+            if (!(in >> val) || (in >> extra)) {
+                PrintErrorCard("Invalid input. Enter a whole number.");
+                return false;
+            }
+            if (val < min_val || val > max_val) {
+                PrintErrorCard("Enter a value from " + std::to_string(min_val) + " to " + std::to_string(max_val) + ".");
+                return false;
+            }
+            out = static_cast<int>(val);
+            return true;
+        }
+
         inline int SafeReadInt(const std::string& prompt, int min_val, int max_val) {
             for (;;) {
-                std::string line = ReadLine(prompt);
-                if (line.find_first_not_of(" \t") == std::string::npos) continue;  // just ENTER, ask again
-
-                std::istringstream in(line);
-                long long val = 0;
-                char extra = 0;
-                if (!(in >> val) || (in >> extra)) {
-                    PrintErrorCard("Invalid input. Enter a whole number.");
-                    continue;
-                }
-                if (val < min_val || val > max_val) {
-                    PrintErrorCard("Enter a value from " + std::to_string(min_val) + " to " + std::to_string(max_val) + ".");
-                    continue;
-                }
-                return static_cast<int>(val);
+                int val = 0;
+                if (ParseChoice(ReadLine(prompt), min_val, max_val, val)) return val;
             }
+        }
+
+        // Like SafeReadInt, but while nothing is being typed it calls
+        // `refresh` twice a second. If refresh redraws the screen (returns
+        // true) the prompt and anything typed so far are printed again. This
+        // keeps shared screens live while the user is deciding what to do.
+        // Needs a real console; with redirected input it falls back to SafeReadInt.
+        template <typename Refresh>
+        inline int ReadChoiceLive(const std::string& prompt, int min_val, int max_val, Refresh&& refresh) {
+#ifdef _WIN32
+            DWORD mode = 0;
+            if (GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode)) {
+                std::string typed;
+                std::cout << prompt << std::flush;
+                auto last_check = std::chrono::steady_clock::now();
+
+                for (;;) {
+                    if (_kbhit()) {
+                        int c = _getch();
+                        if (c == 0 || c == 0xE0) { _getch(); continue; }        // arrow/function keys
+                        if (c == 3 || (c == 26 && typed.empty())) throw InputClosed();  // Ctrl+C / Ctrl+Z
+                        if (c == '\r' || c == '\n') {
+                            std::cout << "\n";
+                            int val = 0;
+                            if (ParseChoice(typed, min_val, max_val, val)) return val;
+                            typed.clear();
+                            std::cout << prompt << std::flush;
+                        } else if (c == '\b') {
+                            if (!typed.empty()) { typed.pop_back(); std::cout << "\b \b" << std::flush; }
+                        } else if (c >= 32 && c < 127 && typed.size() < 12) {
+                            typed += static_cast<char>(c);
+                            std::cout << static_cast<char>(c) << std::flush;
+                        }
+                        continue;
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - last_check >= std::chrono::milliseconds(500)) {
+                        last_check = now;
+                        if (refresh()) std::cout << prompt << typed << std::flush;
+                    }
+                }
+            }
+#endif
+            (void)refresh;
+            return SafeReadInt(prompt, min_val, max_val);
         }
 
         inline void Pause() {
@@ -694,6 +757,7 @@ namespace Toolkit {
         // producer-consumer
         int32_t capacity;
         int32_t items[kMaxBufferSize];
+        int32_t item_from[kMaxBufferSize];   // terminal that produced each item
         int32_t front;
         int32_t rear;
         int32_t count;
@@ -709,6 +773,7 @@ namespace Toolkit {
 
         // last few things that happened, from every terminal
         uint32_t activity_next;
+        uint32_t change_seq;      // bumped on every change so screens know when to redraw
         ActivityLine activity[kActivitySize];
     };
 
@@ -794,6 +859,7 @@ namespace Toolkit {
             uint64_t reads = 0, writes = 0;
             int waiting_producers = 0, waiting_consumers = 0, waiting_readers = 0, waiting_writers = 0;
             int terminals_online = 0;
+            uint32_t version = 0;
             std::vector<std::string> activity;
         };
 
@@ -909,6 +975,7 @@ namespace Toolkit {
 
             const SharedData& d = block_->data;
             s.ok = true;
+            s.version = d.change_seq;
             s.capacity = d.capacity;
             s.count = d.count;
             s.front = d.front;
@@ -974,6 +1041,7 @@ namespace Toolkit {
                 }
 
                 d.items[d.rear] = value;
+                d.item_from[d.rear] = number_;
                 d.rear = (d.rear + 1) % d.capacity;
                 d.count++;
                 d.produced++;
@@ -1011,11 +1079,13 @@ namespace Toolkit {
                 }
 
                 int item = d.items[d.front];
+                int from = d.item_from[d.front];
                 d.front = (d.front + 1) % d.capacity;
                 d.count--;
                 d.consumed++;
                 logActivityLocked("consumed " + std::to_string(item));
-                result = OpResult::Ok(item, "You consumed " + std::to_string(item) + ".");
+                std::string origin = (from == number_ || from == 0) ? "" : " (produced by Terminal " + std::to_string(from) + ")";
+                result = OpResult::Ok(item, "You consumed " + std::to_string(item) + origin + ".");
             }
             empty_.post();
             return result;
@@ -1273,12 +1343,14 @@ namespace Toolkit {
             line.terminal = number_;
             std::snprintf(line.text, sizeof(line.text), "%s", text.c_str());
             d.activity_next++;
+            d.change_seq++;
         }
 
         bool setWaiting(int32_t what) {
             CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
             if (!lock.held()) return false;
             block_->data.terminals[my_index_].waiting = what;
+            block_->data.change_seq++;
             return true;
         }
 
@@ -1583,6 +1655,31 @@ namespace Toolkit {
             std::cout << "\n";
         }
 
+        // Spinner tick callback: redraws with `draw` whenever the shared state
+        // has changed since it was last shown.
+        template <typename Draw>
+        inline auto LiveRedraw(uint32_t shown_version, Draw draw) {
+            return [shown_version, draw]() mutable {
+                auto s = g_Session.snapshot();
+                if (!s.ok || s.version == shown_version) return;
+                shown_version = s.version;
+                draw(s);
+            };
+        }
+
+        // Same idea for the idle prompt: returns true when it redrew, so the
+        // prompt can be printed again underneath.
+        template <typename Draw>
+        inline auto IdleRedraw(uint32_t shown_version, Draw draw) {
+            return [shown_version, draw]() mutable {
+                auto s = g_Session.snapshot();
+                if (!s.ok || s.version == shown_version) return false;
+                shown_version = s.version;
+                draw(s);
+                return true;
+            };
+        }
+
         inline bool RequireSession() {
             if (g_Session.isAttached()) return true;
             UI::ClearScreen();
@@ -1606,11 +1703,10 @@ namespace Toolkit {
             Timer timer;
             timer.start();
 
-            for (bool running = true; running; ) {
-                auto snap = g_Session.snapshot();
-                View::PrintSharedTop("PRODUCER-CONSUMER", first, snap);
-                first = false;
-
+            // Draws the whole screen. Also used while waiting, so changes made
+            // in other terminals show up live during the countdown.
+            auto draw = [&](const SharedSession::Snapshot& snap, bool animate, const UI::Status& st, bool waiting) {
+                View::PrintSharedTop("PRODUCER-CONSUMER", animate, snap);
                 if (snap.ok) {
                     std::cout << "  " << Color::Bold() << "Buffer" << Color::Reset() << "  " << snap.count << " of " << snap.capacity << " slots in use\n";
                     View::PrintSlots(snap.capacity,
@@ -1625,23 +1721,35 @@ namespace Toolkit {
                 } else {
                     UI::PrintWarningCard("Shared state is temporarily unavailable.");
                 }
-
                 std::cout << "\n";
-                UI::PrintStatus(status);
-                View::PrintActions({{"1", "Produce"}, {"2", "Consume"}, {"3", "Refresh"}, {"0", "Back"}});
+                UI::PrintStatus(st);
+                if (!waiting) View::PrintActions({{"1", "Produce"}, {"2", "Consume"}, {"3", "Refresh"}, {"0", "Back"}});
+            };
 
-                int option = UI::SafeReadInt("  Select: ", 0, 3);
+            for (bool running = true; running; ) {
+                auto snap = g_Session.snapshot();
+                draw(snap, first, status, false);
+                first = false;
+
+                int option = UI::ReadChoiceLive("  Select: ", 0, 3,
+                    View::IdleRedraw(snap.version, [&](const SharedSession::Snapshot& s) { draw(s, false, status, false); }));
                 status = {};
 
                 if (option == 1) {
                     int value = UI::SafeReadInt("  Item value (1-9999): ", 1, 9999);
                     OpResult r = UI::RunWithSpinner("Waiting for a free slot", timeout_ms,
-                        [&] { return g_Session.produce(value, timeout_ms); });
+                        [&] { return g_Session.produce(value, timeout_ms); },
+                        View::LiveRedraw(snap.version, [&](const SharedSession::Snapshot& s) {
+                            draw(s, false, UI::Status::Info("Producing " + std::to_string(value) + ". Waiting for a free slot."), true);
+                        }));
                     if (r.ok()) done++;
                     status = View::ToStatus(r, timeouts, failures);
                 } else if (option == 2) {
                     OpResult r = UI::RunWithSpinner("Waiting for an item", timeout_ms,
-                        [&] { return g_Session.consume(timeout_ms); });
+                        [&] { return g_Session.consume(timeout_ms); },
+                        View::LiveRedraw(snap.version, [&](const SharedSession::Snapshot& s) {
+                            draw(s, false, UI::Status::Info("Consuming. Waiting for an item."), true);
+                        }));
                     if (r.ok()) done++;
                     status = View::ToStatus(r, timeouts, failures);
                 } else if (option == 0) {
@@ -1723,11 +1831,10 @@ namespace Toolkit {
             Timer timer;
             timer.start();
 
-            for (bool running = true; running; ) {
-                auto snap = g_Session.snapshot();
-                View::PrintSharedTop("READERS-WRITERS", first, snap);
-                first = false;
-
+            // Draws the whole screen. Also used while waiting, so changes made
+            // in other terminals show up live during the countdown.
+            auto draw = [&](const SharedSession::Snapshot& snap, bool animate, const UI::Status& st, bool waiting) {
+                View::PrintSharedTop("READERS-WRITERS", animate, snap);
                 if (snap.ok) {
                     std::cout << "  " << Color::Bold() << "Database" << Color::Reset() << "\n";
                     View::PrintLabel("Value", Color::Green() + Color::Bold() + std::to_string(snap.db_value) + Color::Reset());
@@ -1739,17 +1846,26 @@ namespace Toolkit {
                 } else {
                     UI::PrintWarningCard("Shared state is temporarily unavailable.");
                 }
-
                 std::cout << "\n";
-                UI::PrintStatus(status);
-                View::PrintActions({{"1", "Read"}, {"2", "Write"}, {"3", "Refresh"}, {"0", "Back"}});
+                UI::PrintStatus(st);
+                if (!waiting) View::PrintActions({{"1", "Read"}, {"2", "Write"}, {"3", "Refresh"}, {"0", "Back"}});
+            };
 
-                int option = UI::SafeReadInt("  Select: ", 0, 3);
+            for (bool running = true; running; ) {
+                auto snap = g_Session.snapshot();
+                draw(snap, first, status, false);
+                first = false;
+
+                int option = UI::ReadChoiceLive("  Select: ", 0, 3,
+                    View::IdleRedraw(snap.version, [&](const SharedSession::Snapshot& s) { draw(s, false, status, false); }));
                 status = {};
 
                 if (option == 1) {
                     OpResult r = UI::RunWithSpinner("Waiting for read access", timeout_ms,
-                        [&] { return g_Session.beginRead(timeout_ms); });
+                        [&] { return g_Session.beginRead(timeout_ms); },
+                        View::LiveRedraw(snap.version, [&](const SharedSession::Snapshot& s) {
+                            draw(s, false, UI::Status::Info("Requesting read access."), true);
+                        }));
                     if (!r.ok()) {
                         status = View::ToStatus(r, timeouts, failures);
                         continue;
@@ -1769,7 +1885,10 @@ namespace Toolkit {
                     status = UI::Status::Ok("Read lock released.");
                 } else if (option == 2) {
                     OpResult r = UI::RunWithSpinner("Waiting for write access", timeout_ms,
-                        [&] { return g_Session.beginWrite(timeout_ms); });
+                        [&] { return g_Session.beginWrite(timeout_ms); },
+                        View::LiveRedraw(snap.version, [&](const SharedSession::Snapshot& s) {
+                            draw(s, false, UI::Status::Info("Requesting write access."), true);
+                        }));
                     if (!r.ok()) {
                         status = View::ToStatus(r, timeouts, failures);
                         continue;
