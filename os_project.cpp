@@ -806,60 +806,56 @@ namespace Toolkit {
 
             if (!openBlock(error, true)) return false;
 
+            // Every failure below leaves the locked scope before closeAll(), so
+            // the lock is released while the shared memory is still mapped.
+            bool ok = false;
             {
                 CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
                 if (!lock.held()) {
                     error = "shared state is locked by another terminal";
-                    closeAll();
-                    return false;
-                }
-                if (block_->magic != kMagic) {
-                    initialise(capacity_hint);
-                } else if (block_->layout_size != sizeof(SharedBlock)) {
+                } else if (block_->magic == kMagic && block_->layout_size != sizeof(SharedBlock)) {
                     error = "another terminal is running a different version; close it and try again";
-                    closeAll();
-                    return false;
-                }
-                if (!openSemaphoresLocked()) {
-                    error = "could not create shared semaphores";
-                    closeAll();
-                    return false;
+                } else {
+                    if (block_->magic != kMagic) initialise(capacity_hint);
+                    ok = openSemaphoresLocked();
+                    if (!ok) error = "could not create shared semaphores";
                 }
             }
+            if (!ok) { closeAll(); return false; }
 
             reapDeadTerminals();   // free any slots left behind by crashed terminals
 
+            ok = false;
             {
                 CrossLock lock(state_lock_, block_->state_owner, kStateLockMs);
-                if (!lock.held()) {
-                    error = "shared state is locked by another terminal";
-                    closeAll();
-                    return false;
-                }
                 SharedData& d = block_->data;
 
                 my_index_ = -1;
-                for (int i = 0; i < kMaxTerminals; ++i) {
-                    if (d.terminals[i].pid == 0) { my_index_ = i; break; }
-                }
-                if (my_index_ < 0) {
-                    error = "all " + std::to_string(kMaxTerminals) + " terminal limit reached";
-                    closeAll();
-                    return false;
-                }
-
-                // Lowest number nobody else is using, so people see 1, 2, 3...
-                number_ = 1;
-                for (bool taken = true; taken; ) {
-                    taken = false;
-                    for (const auto& t : d.terminals) {
-                        if (t.pid != 0 && t.number == number_) { taken = true; ++number_; break; }
+                if (!lock.held()) {
+                    error = "shared state is locked by another terminal";
+                } else {
+                    for (int i = 0; i < kMaxTerminals; ++i) {
+                        if (d.terminals[i].pid == 0) { my_index_ = i; break; }
                     }
+                    if (my_index_ < 0) error = "terminal limit reached (" + std::to_string(kMaxTerminals) + ")";
                 }
 
-                d.terminals[my_index_] = TerminalSlot{pid_, number_, stamp_, 0, 0, kNotWaiting};
-                logActivityLocked("connected");
+                if (my_index_ >= 0) {
+                    // Lowest number nobody else is using, so people see 1, 2, 3...
+                    number_ = 1;
+                    for (bool taken = true; taken; ) {
+                        taken = false;
+                        for (const auto& t : d.terminals) {
+                            if (t.pid != 0 && t.number == number_) { taken = true; ++number_; break; }
+                        }
+                    }
+
+                    d.terminals[my_index_] = TerminalSlot{pid_, number_, stamp_, 0, 0, kNotWaiting};
+                    logActivityLocked("connected");
+                    ok = true;
+                }
             }
+            if (!ok) { closeAll(); return false; }
 
             stop_reaper_ = false;
             reaper_ = std::thread(&SharedSession::reaperLoop, this);
